@@ -1,0 +1,2 @@
+dataset: voicebank_demand
+model: mamba_unet
