@@ -1,0 +1,27 @@
+# Environment
+.venv/
+.env/
+env/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+
+# Logs & temporare
+*.log
+*.tmp
+*.swp
+
+# Output / build
+dist/
+build/
+*.egg-info/
