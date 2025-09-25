@@ -1,1 +1,36 @@
-# pyproject.toml (poetry/uv example)
+[project]
+name = "ultra-low-power-se"
+version = "0.1.0"
+description = "Ultra-Low-Power Speech Enhancement at the Edge"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "torch==2.4.0",
+  "torchaudio==2.4.0",
+  "numpy==1.26.4",
+  "omegaconf==2.3.0",
+  "soundfile==0.12.1",
+  "onnx==1.16.2",
+  "onnxruntime==1.19.0",
+  "tqdm==4.66.4",
+  "pyyaml==6.0.2",
+]
+
+[project.scripts]
+se = "se_cli.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+
+package = true
+[tool.hatch.build.targets.wheel]
+packages = [
+  "se_cli",
+  "datasets",
+  "se_models",
+  "metrics",
+  "runners",
+  "deploy",
+]

@@ -1,1 +1,18 @@
-seed: 42
+project: ultra-low-power-se
+seed: 1337
+data:
+  name: voicebank_demand
+  root: ./data/vb_demand
+  batch_size: 8
+model:
+  name: mamba_unet
+  ckpt: null
+train:
+  epochs: 50
+  lr: 1e-3
+  optimizer: adamw
+eval:
+  metrics: [pesq, stoi, snr]
+export:
+  onnx_opset: 18
+  quantize: true
