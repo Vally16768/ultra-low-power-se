@@ -25,3 +25,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Datasets
+LibriSpeech/
+VoiceBank_DEMAND/
+data/

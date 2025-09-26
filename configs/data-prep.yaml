@@ -1,0 +1,21 @@
+seed: 1337
+sample_rate: 16000
+frame_ms: 20
+hop_ms: 10           # 50% overlap
+target_lufs: -23.0   # opțional, normalizare loudness
+
+paths:
+  clean_list: data/lists/train_clean.txt
+  noise_list: data/lists/noise_train.txt
+  rir_list:   data/lists/rir_list.txt
+  out_dir:    data/prepared/train
+
+mixing:
+  snr_db: [0, 5, 10]     # pentru train; pentru challenge: [-5,0,5,10]
+  segment_sec: [2.0, 8.0] # tăieturi random din curat/noise
+  reverb_prob: 0.3
+  gain_jitter_db: [-1.0, 1.0]
+  codec: null            # pentru train; challenge va seta opus_16 sau opus_24
+
+streaming_eval:
+  latency_budget_ms: 40
