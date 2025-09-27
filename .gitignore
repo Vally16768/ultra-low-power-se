@@ -30,3 +30,4 @@ build/
 LibriSpeech/
 VoiceBank_DEMAND/
 data/
+artifacts/

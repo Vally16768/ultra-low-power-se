@@ -1,68 +1,75 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LIBRI_WAV_ROOT="data/clean_wav/libri"
-DEMAND_DIR="datasets/DEMAND"
-CUSTOM_DIR="datasets/noises_custom"
+ROOT="data"
+LIBRI="$ROOT/clean_wav/libri"
+DEMAND="$ROOT/noise/demand"
+NOISES_CUSTOM="$ROOT/noise/custom"
+NOISES_DEV="$ROOT/noise/dev"
+NOISES_UNSEEN="$ROOT/noise/unseen"
+NOISES_SYNTH="$ROOT/noise/synth"   # <<— nou: sintetice
+RIRS="$ROOT/rirs"
 
-LISTS_DIR="data/lists"
-mkdir -p "$LISTS_DIR"
+mkdir -p "$ROOT/lists"
 
-# --- clean speech ---
-# Train: preferăm test-other + test-clean (ca fallback), pentru că nu ai train-*; dev-* le folosim pentru val.
-> "$LISTS_DIR/train_clean.txt"
-for SPLIT in test-other test-clean; do
-  if [ -d "$LIBRI_WAV_ROOT/$SPLIT" ]; then
-    find "$LIBRI_WAV_ROOT/$SPLIT" -type f -name "*.wav" | sort >> "$LISTS_DIR/train_clean.txt"
+# ---------- CLEAN ----------
+# train: train-clean-* dacă există, altfel dev-other ca fallback
+if compgen -G "$LIBRI/train-clean-*/**/*.wav" > /dev/null; then
+  find "$LIBRI" -type f -path "$LIBRI/train-clean-*/*" -iname "*.wav" | sort > "$ROOT/lists/train_clean.txt"
+else
+  if [ -d "$LIBRI/dev-other" ]; then
+    find "$LIBRI/dev-other" -type f -iname "*.wav" | sort > "$ROOT/lists/train_clean.txt"
+  else
+    echo "Eroare: nu găsesc $LIBRI/train-clean-* sau $LIBRI/dev-other pentru train." >&2
+    exit 2
+  fi
+fi
+
+# dev: dev-clean obligatoriu
+if [ -d "$LIBRI/dev-clean" ]; then
+  find "$LIBRI/dev-clean" -type f -iname "*.wav" | sort > "$ROOT/lists/dev_clean.txt"
+else
+  echo "Eroare: nu găsesc $LIBRI/dev-clean." >&2
+  exit 2
+fi
+
+# ---------- NOISES ----------
+# train noises: DEMAND + custom + synth (oricare există)
+: > "$ROOT/lists/noise_train.txt"
+for D in "$DEMAND" "$NOISES_CUSTOM" "$NOISES_SYNTH"; do
+  if [ -d "$D" ]; then
+    find "$D" -type f -iname "*.wav" | sort >> "$ROOT/lists/noise_train.txt"
   fi
 done
-if [ ! -s "$LISTS_DIR/train_clean.txt" ]; then
-  echo "[ERR] Nu am găsit clean WAV pentru TRAIN (test-clean/other convertite). Rulează scripts/prepare_librispeech.sh."
-  exit 1
+if [ ! -s "$ROOT/lists/noise_train.txt" ]; then
+  echo "Eroare: nu am găsit zgomote pentru train în $DEMAND / $NOISES_CUSTOM / $NOISES_SYNTH" >&2
+  exit 2
 fi
 
-# Val: dev-clean (+ opțional dev-other pentru val extins)
-if [ -d "$LIBRI_WAV_ROOT/dev-clean" ]; then
-  find "$LIBRI_WAV_ROOT/dev-clean" -type f -name "*.wav" | sort > "$LISTS_DIR/dev_clean.txt"
+# dev noises: dacă ai director dedicat, altfel ia primele 200 din train
+if [ -d "$NOISES_DEV" ]; then
+  find "$NOISES_DEV" -type f -iname "*.wav" | sort > "$ROOT/lists/noise_dev.txt"
 else
-  echo "[ERR] Nu găsesc $LIBRI_WAV_ROOT/dev-clean"; exit 1
+  head -n 200 "$ROOT/lists/noise_train.txt" > "$ROOT/lists/noise_dev.txt"
 fi
 
-# --- noises split (train/dev) ---
-TMP_NOISE_LIST="$(mktemp)"
-{ [ -d "$DEMAND_DIR" ] && find "$DEMAND_DIR" -type f -name "*.wav"; \
-  [ -d "$CUSTOM_DIR" ] && find "$CUSTOM_DIR" -type f -name "*.wav"; } \
-  | sort > "$TMP_NOISE_LIST" || true
-
-if [ ! -s "$TMP_NOISE_LIST" ]; then
-  echo "[WARN] Nu există zgomote (DEMAND/noises_custom). Continuăm, dar mixgen va eșua fără ele."
-  : > "$LISTS_DIR/noise_train.txt"
-  : > "$LISTS_DIR/noise_dev.txt"
+# unseen noises: preferă director dedicat; altfel 50 random din train care nu sunt în dev
+if [ -d "$NOISES_UNSEEN" ]; then
+  find "$NOISES_UNSEEN" -type f -iname "*.wav" | sort > "$ROOT/lists/noise_unseen.txt"
 else
-  # împărțim determinist 80/20
-  SEED=1337
-  mapfile -t ALL_NOISES < <(shuf --random-source=<(yes $SEED) "$TMP_NOISE_LIST")
-  N=${#ALL_NOISES[@]}
-  CUT=$(( (N*80 + 99)/100 ))
-  printf "%s\n" "${ALL_NOISES[@]:0:CUT}"   > "$LISTS_DIR/noise_train.txt"
-  printf "%s\n" "${ALL_NOISES[@]:CUT}"     > "$LISTS_DIR/noise_dev.txt"
-  echo "[OK] zgomote: train=$(wc -l < "$LISTS_DIR/noise_train.txt")  dev=$(wc -l < "$LISTS_DIR/noise_dev.txt")"
+  comm -23 <(sort "$ROOT/lists/noise_train.txt") <(sort "$ROOT/lists/noise_dev.txt") | shuf -n 50 > "$ROOT/lists/noise_unseen.txt"
+  # dacă tot a rămas gol (puține fișiere), ia 50 random din train
+  if [ ! -s "$ROOT/lists/noise_unseen.txt" ]; then
+    shuf "$ROOT/lists/noise_train.txt" | head -n 50 > "$ROOT/lists/noise_unseen.txt"
+  fi
 fi
 
-rm -f "$TMP_NOISE_LIST"
-
-# --- RIRs (opțional) ---
-RIRS_DIR="datasets/RIRs"
-if [ -d "$RIRS_DIR" ]; then
-  find "$RIRS_DIR" -type f -name "*.wav" | sort > "$LISTS_DIR/rir_list.txt"
-  echo "[OK] RIR list construit."
-else
-  : > "$LISTS_DIR/rir_list.txt"
-  echo "[WARN] Fără RIRs – fișier gol creat."
+# ---------- RIRs (opțional) ----------
+if [ -d "$RIRS" ]; then
+  find "$RIRS" -type f -iname "*.wav" | sort > "$ROOT/lists/rir_list.txt" || true
 fi
 
-# Rezumat
-echo "==== LISTE ===="
-for f in train_clean.txt dev_clean.txt noise_train.txt noise_dev.txt rir_list.txt; do
-  printf "%-18s %7d\n" "$f" "$(wc -l < "$LISTS_DIR/$f" 2>/dev/null || echo 0)"
+# ---------- Rezumat ----------
+for f in train_clean.txt dev_clean.txt noise_train.txt noise_dev.txt noise_unseen.txt rir_list.txt; do
+  [ -f "$ROOT/lists/$f" ] && printf "%7d  %s\n" "$(wc -l < "$ROOT/lists/$f")" "$ROOT/lists/$f"
 done

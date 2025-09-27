@@ -152,9 +152,9 @@ def main():
     (out_dir/"metadata").mkdir(parents=True, exist_ok=True)
     (out_dir/"manifests").mkdir(parents=True, exist_ok=True)
 
-    cleans = [l.strip() for l in open(args.clean-list) if l.strip()]
-    noises = [l.strip() for l in open(args.noise-list) if l.strip()]
-    rirs   = [l.strip() for l in open(args.rir-list)] if args.rir_list else []
+    cleans = [l.strip() for l in open(args.clean_list) if l.strip()]
+    noises = [l.strip() for l in open(args.noise_list) if l.strip()]
+    rirs   = [l.strip() for l in open(args.rir_list)] if args.rir_list else []
 
     meta_all = []
     for i in range(args.n_mixes):

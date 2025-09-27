@@ -6,14 +6,16 @@ def _get_runner(cmd):
     if cmd == "train":
         from runners import train as r; return r.main
     if cmd == "eval":
-        from runners import evaluate as r; return r.main
+        from runners import infer as r; return r.main
     if cmd == "enhance":
-        from runners import enhance as r; return r.main
+        from runners import infer as r; return r.main
+    if cmd == "score":
+        from runners import score as r; return r.main
     if cmd == "export":
         from runners import export as r; return r.main
     raise SystemExit(f"Comandă necunoscută: {cmd}")
 
-SUBCMDS = {"train","eval","enhance","export"}
+SUBCMDS = {"train","eval","enhance","export","score"}
 
 def _split_on_subcmd(argv):
     """Împarte argv în (globals, cmd, rest) indiferent de poziție."""

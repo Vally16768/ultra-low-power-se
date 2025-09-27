@@ -1,0 +1,121 @@
+experiment:
+  name: mamba_unet_v0
+  seed: 1337
+  notes: "Mamba-UNet tiny, causal, fs=16k, training pe mixuri LibriSpeech+DEMAND"
+
+data:
+  sample_rate: 16000
+  loudness_lufs: -23.0          # null pentru a dezactiva
+  normalize_peak: -0.1          # dBFS, null pentru a dezactiva
+  train_manifest: data/prepared/train/manifests/pairs.csv
+  dev_manifest:   data/prepared/dev/manifests/pairs.csv
+  test_std_manifest: data/prepared/test_standard/manifests/pairs.csv
+  test_challenge_manifests:
+    unseen_noises:  data/prepared/test_challenge/unseen_noises/manifests/pairs.csv
+    reverb:         data/prepared/test_challenge/reverb/manifests/pairs.csv
+    codec_opus_16:  data/prepared/test_challenge/codec_opus/16kbps/manifests/pairs.csv
+    codec_opus_24:  data/prepared/test_challenge/codec_opus/24kbps/manifests/pairs.csv
+    clipping_hard:  data/prepared/test_challenge/clipping/hard/manifests/pairs.csv
+    clipping_soft:  data/prepared/test_challenge/clipping/soft/manifests/pairs.csv
+  batch_size: 8
+  num_workers: 4
+  segment_seconds: [2.0, 8.0]
+  aug:
+    speed_perturb: [0.95, 1.05] # null pentru off
+    bandpass_hz: [80, 7600]     # clamp WB
+    add_gauss_snr_db: null
+
+model:
+  name: mamba_unet
+  causal: true
+  lookahead_ms: 10
+  in_channels: 1
+  base_channels: 32
+  depth: 4
+  mamba:
+    blocks: 2
+    d_state: 16
+    d_model: 128
+    expand: 2
+    dropout: 0.0
+  target_head: waveform          # waveform | complex_mask
+
+train:
+  epochs: 50
+  optimizer: adamw
+  lr: 1.0e-3
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+  grad_clip: 5.0
+  scheduler:
+    name: cosine
+    warmup_epochs: 3
+    min_lr: 1.0e-5
+  early_stop:
+    metric: "dev/PESQ"
+    patience: 8
+    mode: "max"
+  loss:
+    main: l1                    # l1 | l2 | si_sdr_neg | multi
+    lambda_si_sdr: 0.2
+  checkpoint:
+    dir: artifacts/checkpoints/mamba_unet_v0
+    save_top_k: 3
+
+inference:
+  frame_ms: 20
+  hop_ms: 10
+  batch_size: 8
+  streaming: true
+  stream_io:
+    state_in:  ["h_in"]         # listă – suportă multiple state
+    state_out: ["h_out"]
+
+compression:
+  quant:
+    enable: true
+    scheme: int8                # int8 | int8_mix | int16
+    qat: false
+    per_channel: true
+    symmetric: true
+  prune:
+    enable: false
+    amount: 0.3
+    structured: true
+  fold_bn: true
+  distill:
+    enable: false
+    teacher_ckpt: null
+
+export:
+  onnx:
+    enable: true
+    opset: 18
+    path: artifacts/export/mamba_unet_v0.onnx
+    dynamic_axes:
+      noisy:    {0: B, 2: T}    # (B, C, T)
+      enhanced: {0: B, 2: T}
+      h_in:     {0: B}          # (B, H)
+      h_out:    {0: B}
+    inputs:
+      - name: noisy             # (B, 1, T)
+      - name: h_in              # (B, H)
+    outputs:
+      - name: enhanced          # (B, 1, T)
+      - name: h_out             # (B, H)
+    strip_dropout: true
+    simplify: true
+  torchscript:
+    enable: false
+    path: artifacts/export/mamba_unet_v0.ts
+
+evaluation:
+  thresholds:
+    PESQ: 3.00
+    STOI: 0.93
+    DELTA_SNR: 9.0
+    SI_SDR: 10.0
+  streaming_latency_budget_ms: 40
+  non_intrusive:
+    dnsmos: false
+    nisqa:  false
