@@ -10,7 +10,7 @@ on:
 
 permissions:
   contents: read
-  packages: write              # needed to push images to GHCR
+  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -203,7 +203,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -221,19 +220,41 @@ jobs:
           name: smoke-checkpoints
           path: artifacts
 
-      - name: Export ONNX
+      - name: Export ONNX (config → artifacts/export/*.onnx)
         run: |
-          python deploy/export_onnx.py \
-            --ckpt artifacts/checkpoints/exp/model.ckpt \
-            --out artifacts/model.onnx
+          python deploy/export_onnx.py --config configs/exp_mamba_unet.yaml
+
+      - name: Normalize ONNX path to artifacts/model.onnx
+        id: pickonnx
+        run: |
+          set -e
+          DEST="artifacts/model.onnx"
+          SRC="$(ls -1 artifacts/export/*.onnx 2>/dev/null | head -n1 || true)"
+          if [ -z "$SRC" ]; then
+            echo "No ONNX found in artifacts/export"; exit 1
+          fi
+          cp -f "$SRC" "$DEST"
+          echo "path=$DEST" >> "$GITHUB_OUTPUT"
 
       - name: Sanity ONNX
         run: |
-          python deploy/sanity_onnx.py --onnx artifacts/model.onnx --print-json
+          python deploy/sanity_onnx.py --onnx "${{ steps.pickonnx.outputs.path }}" --print-json
+
+      - name: Build lists for quick parity
+        run: |
+          bash scripts/build_lists.sh
+          test -s data/lists/dev_clean.txt
+          test -s data/lists/noise_unseen.txt
 
       - name: Parity check (quick)
         run: |
-          python eval/bench_onnx.py --model artifacts/model.onnx --num-samples 4 --no-audio-out
+          python eval/bench_onnx.py \
+            --model "${{ steps.pickonnx.outputs.path }}" \
+            --clean-list data/lists/dev_clean.txt \
+            --noise-list data/lists/noise_unseen.txt \
+            --n 8 --secs 2.0 \
+            --metrics pesq stoi si_sdr delta_snr_db \
+            --out artifacts/bench_quick.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -246,7 +267,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -317,7 +337,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: abx-audio
-          path: artifacts/abx/**
+        path: artifacts/abx/**
 
   quantize_prune_rescore:
     if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
@@ -325,7 +345,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -343,9 +362,24 @@ jobs:
           name: onnx-export
           path: artifacts
 
-      - name: Quantize + re-score
+      - name: Ensure lists (train/noise)
         run: |
-          python deploy/quantize.py --onnx artifacts/model.onnx --weight-only --out artifacts/model_int8.onnx
+          bash scripts/build_lists.sh
+          test -s data/lists/train_clean.txt
+          test -s data/lists/noise_train.txt
+
+      - name: Quantize (PTQ static) + re-score
+        run: |
+          python deploy/quantize.py \
+            --model artifacts/model.onnx \
+            --static \
+            --calib-list data/lists/train_clean.txt \
+            --noisy-list data/lists/noise_train.txt \
+            --num-calib 40 \
+            --method percentile --percentile 99.9 \
+            --per-channel-weights --auto-keep-boundary \
+            --out artifacts/model_int8.onnx
+
           python runners/infer.py --onnx artifacts/model_int8.onnx --mode offline
           python runners/score.py --ref data/test/clean --est outputs/offline --out artifacts/metrics_int8.json
 
@@ -389,7 +423,7 @@ jobs:
       THRESH_STOI: "0.93"
       THRESH_DELTA_SNR: "9.0"
       THRESH_SI_SDR: "12.0"
-      TOL_PESQ_WB: "0.01"      # toleranțe la regresii vs. golden
+      TOL_PESQ_WB: "0.01"
       TOL_STOI: "0.001"
       TOL_DELTA_SNR: "0.10"
       TOL_SI_SDR: "0.10"

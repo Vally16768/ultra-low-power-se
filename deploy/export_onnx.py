@@ -101,7 +101,7 @@ class KeepChannelWrapper(torch.nn.Module):
 # -------------------------
 # Export logic
 # -------------------------
-def export_onnx(cfg: Dict[str, Any]) -> Path:
+def export_onnx(cfg: Dict[str, Any], opset_override: Optional[int] = None) -> Path:
     onnx_cfg = cfg.get("export", {}).get("onnx", {})
     sr = int(cfg.get("data", {}).get("sample_rate", 16000))
     frame_ms = int(cfg.get("inference", {}).get("frame_ms", 20))
@@ -128,9 +128,10 @@ def export_onnx(cfg: Dict[str, Any]) -> Path:
     model = KeepChannelWrapper(base_model).to(device).eval()
 
     # I/O names & dynamic axes from config (will be reconciled with actual signature)
-    path = Path(onnx_cfg.get("path", f"artifacts/export/{cfg.get('experiment',{}).get('name','model')}.onnx"))
+    default_name = cfg.get('experiment', {}).get('name', 'model')
+    path = Path(onnx_cfg.get("path", f"artifacts/export/{default_name}.onnx"))
     path.parent.mkdir(parents=True, exist_ok=True)
-    opset = int(onnx_cfg.get("opset", 18))
+    opset = int(opset_override if opset_override is not None else onnx_cfg.get("opset", 18))
 
     # Desired (from config), but may contain h_in/h_out
     inputs_cfg: List[Dict[str, str]]  = onnx_cfg.get("inputs",  [{"name": "noisy"}] + ([{"name": "h_in"}]  if is_stateful else []))
@@ -322,13 +323,14 @@ def parity_test(cfg: Dict[str, Any], onnx_path: Path, n_frames: int = 1000, tol:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="configs/<exp>.yaml")
+    ap.add_argument("--opset", type=int, default=None, help="override opset_version pentru export (ex: 17)")
     ap.add_argument("--skip-parity", action="store_true", help="nu rula testul de paritate")
     ap.add_argument("--frames", type=int, default=1000, help="numărul de cadre pt. paritate")
     ap.add_argument("--tol", type=float, default=1e-5, help="toleranța L2")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config, "r"))
-    onnx_path = export_onnx(cfg)
+    onnx_path = export_onnx(cfg, opset_override=args.opset)
 
     if not args.skip_parity:
         parity_test(cfg, onnx_path, n_frames=args.frames, tol=args.tol)
