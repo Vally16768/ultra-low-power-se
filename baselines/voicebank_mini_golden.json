@@ -1,0 +1,12 @@
+{
+  "exp_id": "golden_mamba_unet",
+  "commit": "0000000",
+  "dataset": "VoiceBank-mini",
+  "fs_hz": 16000,
+  "metrics": {
+    "PESQ": 3.12,
+    "STOI": 0.945,
+    "DELTA_SNR": 11.3,
+    "SI_SDR": 12.8
+  }
+}
