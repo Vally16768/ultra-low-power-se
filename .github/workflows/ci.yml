@@ -269,12 +269,53 @@ jobs:
           python runners/infer.py  --config configs/exp_mamba_unet.yaml --mode offline
           python runners/score.py  --ref data/test/clean --est outputs/offline --out artifacts/metrics.json
 
+      - name: Augment metrics.json (schema extinsă)
+        env:
+          EXP_ID: "mamba_unet_q8p30_stream"
+          DATASET: "VBD_test"
+        run: |
+          python tools/augment_metrics.py --metrics artifacts/metrics.json \
+                --exp-id "$EXP_ID" --dataset "$DATASET" --commit "$GITHUB_SHA"
+
+      - name: Compute timing/RTF (offline batch)
+        run: |
+          python tools/compute_timing.py \
+                --wav-dir outputs/offline --out artifacts/timing.json
+
+      - name: Build model card
+        run: |
+          python reports/build_model_card.py \
+                --metrics artifacts/metrics.json \
+                --timing artifacts/timing.json \
+                --out artifacts/model_card.md
+
       - uses: actions/upload-artifact@v4
         with:
           name: metrics-fp32
           path: |
             artifacts/metrics.json
+            artifacts/timing.json
+            artifacts/model_card.md
             outputs/offline/**
+
+ab_regression:
+  if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+  needs: [infer_offline_score]
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with: { python-version: "3.11", cache: pip }
+    - name: Prep A/B/X set
+      run: |
+        python ab/prepare_abx.py \
+          --ref data/test/clean \
+          --est outputs/offline \
+          --out artifacts/abx
+    - uses: actions/upload-artifact@v4
+      with:
+        name: abx-audio
+        path: artifacts/abx/**
 
   quantize_prune_rescore:
     if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
@@ -313,43 +354,92 @@ jobs:
             artifacts/model_int8.onnx
             artifacts/metrics_int8.json
 
-  gate_metrics:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule' || github.event_name == 'pull_request'
-    needs: [infer_offline_score]
-    runs-on: ubuntu-latest
-    env:
-      THRESH_PESQ_WB: "3.00"
-      THRESH_STOI: "0.93"
-      THRESH_DELTA_SNR: "9.0"
-      THRESH_SI_SDR: "12.0"
-    steps:
-      - uses: actions/checkout@v4
+report_build:
+  needs: [quantize_prune_rescore]
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with: { python-version: "3.11", cache: pip }
+    - name: Get artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: _dl
+    - name: Build HTML report
+      run: |
+        python reports/build_report.py \
+          --fp32 _dl/metrics-fp32/artifacts/metrics.json \
+          --int8 _dl/metrics-int8/artifacts/metrics_int8.json \
+          --out artifacts/report.html
+    - uses: actions/upload-artifact@v4
+      with:
+        name: html-report
+        path: artifacts/report.html
 
-      - name: Download metrics
-        uses: actions/download-artifact@v4
-        with:
-          name: metrics-fp32
-          path: artifacts_dl
+gate_metrics:
+  if: github.ref == 'refs/heads/main' || github.event_name == 'schedule' || github.event_name == 'pull_request'
+  needs: [infer_offline_score]
+  runs-on: ubuntu-latest
+  env:
+    THRESH_PESQ_WB: "3.00"
+    THRESH_STOI: "0.93"
+    THRESH_DELTA_SNR: "9.0"
+    THRESH_SI_SDR: "12.0"
+    TOL_PESQ_WB: "0.01"      # toleranțe la regresii vs. golden
+    TOL_STOI: "0.001"
+    TOL_DELTA_SNR: "0.10"
+    TOL_SI_SDR: "0.10"
+  steps:
+    - uses: actions/checkout@v4
 
-      - name: Gate vs thresholds
-        run: |
-          python - <<'PY'
-          import json,sys,os
-          m=json.load(open('artifacts_dl/artifacts/metrics.json'))
-          mm=m.get("metrics", m)
-          thr={ "pesq_wb":float(os.environ["THRESH_PESQ_WB"]),
-                "stoi":float(os.environ["THRESH_STOI"]),
-                "delta_snr_db":float(os.environ["THRESH_DELTA_SNR"]),
-                "si_sdr_db":float(os.environ["THRESH_SI_SDR"]) }
-          fails=[]
-          for k,vmin in thr.items():
-              v=mm.get(k, float("-inf"))
-              if v < vmin: fails.append((k,v,vmin))
-              print(f"[gate] {k}: {v} >= {vmin} ? {'OK' if v>=vmin else 'FAIL'}")
-          if fails:
-              print("GATE FAIL:", fails); sys.exit(1)
-          print("GATE PASS:", mm)
-          PY
+    - name: Download metrics (FP32)
+      uses: actions/download-artifact@v4
+      with:
+        name: metrics-fp32
+        path: artifacts_dl
+
+    - name: Gate absolute thresholds
+      run: |
+        python - <<'PY'
+        import json,os,sys
+        m=json.load(open('artifacts_dl/artifacts/metrics.json'))
+        mm=m.get("metrics",m)
+        thr={ "pesq_wb":float(os.environ["THRESH_PESQ_WB"]),
+              "stoi":float(os.environ["THRESH_STOI"]),
+              "delta_snr_db":float(os.environ["THRESH_DELTA_SNR"]),
+              "si_sdr_db":float(os.environ["THRESH_SI_SDR"]) }
+        fails=[]
+        for k,vmin in thr.items():
+            v=float(mm.get(k,-1e9))
+            print(f"[ABS] {k}: {v:.4f} >= {vmin:.4f} ?", "OK" if v>=vmin else "FAIL")
+            if v<vmin: fails.append((k,v,vmin))
+        if fails:
+            print("[ABS] FAIL:",fails); sys.exit(1)
+        print("[ABS] PASS")
+        PY
+
+    - name: Gate vs GOLDEN (delta >= -tolerance)
+      run: |
+        python - <<'PY'
+        import json,os,sys
+        cur=json.load(open('artifacts_dl/artifacts/metrics.json'))
+        cur=cur.get("metrics",cur)
+        golden=json.load(open('.github/golden_metrics.json'))
+        golden=golden.get("metrics",golden)
+
+        tol={ "pesq_wb":float(os.environ["TOL_PESQ_WB"]),
+              "stoi":float(os.environ["TOL_STOI"]),
+              "delta_snr_db":float(os.environ["TOL_DELTA_SNR"]),
+              "si_sdr_db":float(os.environ["TOL_SI_SDR"]) }
+        fails=[]
+        for k,t in tol.items():
+            d = float(cur.get(k,-1e9)) - float(golden.get(k,-1e9))
+            print(f"[GOLDEN] {k}: Δ={d:+.4f} (accept ≥ {-t:+.4f})", "OK" if d>=-t else "FAIL")
+            if d < -t: fails.append((k,d))
+        if fails:
+            print("[GOLDEN] FAIL:",fails); sys.exit(1)
+        print("[GOLDEN] PASS")
+        PY
 
   hil_nightly:
     if: github.event_name == 'schedule'
