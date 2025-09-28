@@ -20,7 +20,6 @@ def resolve_factory(factory_arg=None):
         ("se_models.mamba_unet.model","Model"),
         ("se_models.mamba_unet.model","MambaUNet"),
     ]
-    from importlib import import_module
     for mod, name in candidates:
         try:
             m = import_module(mod); fn = getattr(m, name)
