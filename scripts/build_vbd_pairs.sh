@@ -1,31 +1,41 @@
-# scripts/build_vbd_pairs.sh
 #!/usr/bin/env bash
 set -euo pipefail
+# Construieste perechi pentru VoiceBank-DEMAND (test standard)
+# Folosește layout-ul clasic VBD:
+#   <VBD_ROOT>/clean_testset_wav/*.wav
+#   <VBD_ROOT>/noisy_testset_wav/*.wav (sau DEMAND/testset_wav)
+# Setează VBD_ROOT în .env.local dacă diferă.
 
-VBD="datasets/VoiceBank_DEMAND"
-OUT_DIR="data/prepared/test_standard/manifests"
-mkdir -p "$OUT_DIR"
-PAIRS="$OUT_DIR/pairs.csv"
+: "${VBD_ROOT:=data/VoiceBank}"
 
-NOISY_TEST="$VBD/noisy_testset_wav"
-CLEAN_TEST="$VBD/clean_testset_wav"
+OUT="data/lists/vbd_pairs_test.csv"
+mkdir -p "$(dirname "$OUT")"
 
-if [ ! -d "$NOISY_TEST" ] || [ ! -d "$CLEAN_TEST" ]; then
-  echo "[ERR] VoiceBank_DEMAND nu e în structura așteptată: $NOISY_TEST / $CLEAN_TEST"
-  exit 1
+CLEAN_DIR="${VBD_ROOT}/clean_testset_wav"
+NOISY_DIR="${VBD_ROOT}/noisy_testset_wav"
+ALT_NOISY_DEMAND="data/DEMAND/testset_wav"  # fallback uzual în unele repo-uri
+
+if [[ ! -d "$CLEAN_DIR" ]]; then
+  echo "[build_vbd_pairs] WARNING: $CLEAN_DIR not found. Skipping pairs."
+  : > "$OUT"
+  exit 0
 fi
 
-echo "noisy,clean" > "$PAIRS"
+# Manifest (noisy,clean,meta) — meta gol pentru VBD
+echo "noisy,clean,meta" > "$OUT"
 
-# mapăm fiecare fișier noisy la clean cu același nume
-while IFS= read -r -d '' n; do
-  base="$(basename "$n")"
-  c="$CLEAN_TEST/$base"
-  if [ -f "$c" ]; then
-    echo "$n,$c" >> "$PAIRS"
+shopt -s nullglob
+for c in "$CLEAN_DIR"/*.wav; do
+  base="$(basename "$c")"
+  n1="$NOISY_DIR/$base"
+  n2="$ALT_NOISY_DEMAND/$base"
+  if [[ -f "$n1" ]]; then
+    echo "$n1,$c," >> "$OUT"
+  elif [[ -f "$n2" ]]; then
+    echo "$n2,$c," >> "$OUT"
   else
-    echo "[WARN] Lipsește clean pentru $base"
+    echo "[build_vbd_pairs] WARN: No noisy match for $base" >&2
   fi
-done < <(find "$NOISY_TEST" -type f -name "*.wav" -print0 | sort -z)
+done
 
-echo "[OK] Scris $PAIRS ($(($(wc -l < "$PAIRS")-1)) perechi)."
+echo "[build_vbd_pairs] wrote: $OUT"
