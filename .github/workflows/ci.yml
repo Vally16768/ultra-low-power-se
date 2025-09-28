@@ -4,13 +4,21 @@ on:
   pull_request:
   push:
     branches: [ main ]
+  schedule:
+    - cron: "0 2 * * *"        # nightly @ 02:00 UTC
+  workflow_dispatch:
 
 permissions:
   contents: read
+  packages: write              # needed to push images to GHCR
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   ping:
@@ -64,15 +72,9 @@ jobs:
           cache: pip
 
       - name: System deps (libsndfile for soundfile)
-        shell: bash
         run: |
-          if command -v sudo >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y libsndfile1
-          else
-            apt-get update -y
-            apt-get install -y libsndfile1
-          fi
+          sudo apt-get update -y
+          sudo apt-get install -y libsndfile1
 
       - name: Install Python deps (metrics)
         run: |
@@ -90,8 +92,6 @@ jobs:
           path: |
             .pytest_cache
             **/.pytest_cache
-
-  # --- Etapa 2: opțional, rulează doar dacă există fișierele necesare ---
 
   sanity_onnx:
     runs-on: ubuntu-latest
@@ -113,7 +113,6 @@ jobs:
 
       - name: Find any ONNX in repo (optional)
         id: findonnx
-        shell: bash
         run: |
           set -e
           FILE=$(git ls-files '*.onnx' | head -n1 || true)
@@ -130,59 +129,6 @@ jobs:
         if: steps.findonnx.outputs.found == 'true'
         run: |
           python deploy/sanity_onnx.py --onnx "${{ steps.findonnx.outputs.path }}"
-
-  gate_metrics:
-    runs-on: ubuntu-latest
-    needs: [metrics_unit]
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Validate metrics.json against gates (optional)
-        shell: bash
-        run: |
-          set -e
-          METRICS="artifacts/metrics.json"
-          GATES=".github/gates.json"
-          if [ ! -f "$METRICS" ]; then
-            echo "No $METRICS present; skipping gate."
-            exit 0
-          fi
-
-          python - << 'PY'
-          import json, sys, os
-          METRICS=os.environ.get("METRICS","artifacts/metrics.json")
-          GATES=os.environ.get("GATES",".github/gates.json")
-
-          with open(METRICS) as f:
-              m=json.load(f)
-
-          # thresholds default (override with .github/gates.json if exists)
-          thr = {
-              "pesq_wb": 3.00,
-              "stoi": 0.93,
-              "delta_snr_db": 9.0,
-              "si_sdr_db": 12.0,
-          }
-          if os.path.exists(GATES):
-              try:
-                  thr.update(json.load(open(GATES)))
-              except Exception as e:
-                  print(f"[gate] warn: could not read {GATES}: {e}", file=sys.stderr)
-
-          metrics = m.get("metrics", m)  # accept either flat or nested
-          fails=[]
-          for k, t in thr.items():
-              v = float(metrics.get(k, float("-inf")))
-              ok = v >= t
-              print(f"[gate] {k}: {v:.4f} >= {t:.4f} ? {'OK' if ok else 'FAIL'}")
-              if not ok: fails.append((k, v, t))
-
-          if fails:
-              print(f"[gate] FAILED: {len(fails)} metric(s) below threshold: {fails}")
-              sys.exit(1)
-          print("[gate] PASSED")
-          PY
 
   build_images:
     if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
@@ -226,19 +172,25 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: pip }
+        with:
+          python-version: "3.11"
+          cache: pip
+
       - name: Deps
         run: |
           sudo apt-get update -y && sudo apt-get install -y libsndfile1
           python -m pip install --upgrade pip
           pip install "torch==2.3.*" --index-url https://download.pytorch.org/whl/cpu
           pip install numpy pyyaml tensorboard soundfile
+
       - name: Smoke train (1 epoch, tiny split)
         env:
           ULTRA_SMOKE: "1"
         run: |
           python runners/train.py --config configs/exp_mamba_unet.yaml
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -251,22 +203,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: pip }
+        with:
+          python-version: "3.11"
+          cache: pip
+
       - name: Deps
         run: |
           python -m pip install --upgrade pip
           pip install onnx onnxruntime "torch==2.3.*" --index-url https://download.pytorch.org/whl/cpu
           pip install numpy soundfile
+
+      - name: Download smoke checkpoints
+        uses: actions/download-artifact@v4
+        with:
+          name: smoke-checkpoints
+          path: artifacts
+
       - name: Export ONNX
         run: |
-          python deploy/export_onnx.py --ckpt artifacts/checkpoints/exp/model.ckpt --out artifacts/model.onnx
+          python deploy/export_onnx.py \
+            --ckpt artifacts/checkpoints/exp/model.ckpt \
+            --out artifacts/model.onnx
+
       - name: Sanity ONNX
         run: |
           python deploy/sanity_onnx.py --onnx artifacts/model.onnx --print-json
+
       - name: Parity check (quick)
         run: |
           python eval/bench_onnx.py --model artifacts/model.onnx --num-samples 4 --no-audio-out
+
       - uses: actions/upload-artifact@v4
         with:
           name: onnx-export
@@ -278,17 +246,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: pip }
+        with:
+          python-version: "3.11"
+          cache: pip
+
       - name: Deps
         run: |
           sudo apt-get update -y && sudo apt-get install -y libsndfile1
           python -m pip install --upgrade pip
           pip install numpy soundfile pesq pystoi onnxruntime
+
+      - name: Download ONNX model
+        uses: actions/download-artifact@v4
+        with:
+          name: onnx-export
+          path: artifacts
+
       - name: Infer offline + score
         run: |
           python runners/infer.py  --config configs/exp_mamba_unet.yaml --mode offline
           python runners/score.py  --ref data/test/clean --est outputs/offline --out artifacts/metrics.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: metrics-fp32
@@ -302,18 +282,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: pip }
+        with:
+          python-version: "3.11"
+          cache: pip
+
       - name: Deps
         run: |
           sudo apt-get update -y && sudo apt-get install -y libsndfile1
           python -m pip install --upgrade pip
           pip install numpy soundfile onnx onnxruntime
+
+      - name: Download ONNX model
+        uses: actions/download-artifact@v4
+        with:
+          name: onnx-export
+          path: artifacts
+
       - name: Quantize + re-score
         run: |
           python deploy/quantize.py --onnx artifacts/model.onnx --weight-only --out artifacts/model_int8.onnx
           python runners/infer.py --onnx artifacts/model_int8.onnx --mode offline
           python runners/score.py --ref data/test/clean --est outputs/offline --out artifacts/metrics_int8.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: metrics-int8
@@ -332,26 +324,28 @@ jobs:
       THRESH_SI_SDR: "12.0"
     steps:
       - uses: actions/checkout@v4
+
       - name: Download metrics
         uses: actions/download-artifact@v4
         with:
           name: metrics-fp32
           path: artifacts_dl
+
       - name: Gate vs thresholds
         run: |
           python - <<'PY'
           import json,sys,os
           m=json.load(open('artifacts_dl/artifacts/metrics.json'))
-          mm=m["metrics"]
+          mm=m.get("metrics", m)
           thr={ "pesq_wb":float(os.environ["THRESH_PESQ_WB"]),
                 "stoi":float(os.environ["THRESH_STOI"]),
                 "delta_snr_db":float(os.environ["THRESH_DELTA_SNR"]),
                 "si_sdr_db":float(os.environ["THRESH_SI_SDR"]) }
           fails=[]
-          if mm.get("pesq_wb",0)<thr["pesq_wb"]: fails.append(("pesq_wb",mm.get("pesq_wb"),thr["pesq_wb"]))
-          if mm.get("stoi",0)<thr["stoi"]: fails.append(("stoi",mm.get("stoi"),thr["stoi"]))
-          if mm.get("delta_snr_db",0)<thr["delta_snr_db"]: fails.append(("delta_snr_db",mm.get("delta_snr_db"),thr["delta_snr_db"]))
-          if mm.get("si_sdr_db",0)<thr["si_sdr_db"]: fails.append(("si_sdr_db",mm.get("si_sdr_db"),thr["si_sdr_db"]))
+          for k,vmin in thr.items():
+              v=mm.get(k, float("-inf"))
+              if v < vmin: fails.append((k,v,vmin))
+              print(f"[gate] {k}: {v} >= {vmin} ? {'OK' if v>=vmin else 'FAIL'}")
           if fails:
               print("GATE FAIL:", fails); sys.exit(1)
           print("GATE PASS:", mm)
@@ -363,11 +357,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11", cache: pip }
+        with:
+          python-version: "3.11"
+          cache: pip
+
       - name: HIL run (placeholder)
         run: |
           echo '{"device":"EDGE_XYZ","power_mw_avg":31.5}' > artifacts/hardware_report.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: hardware-report
