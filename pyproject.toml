@@ -1,90 +1,18 @@
-[project]
-name = "ultra-low-power-se"
-version = "0.1.0"
-description = "Ultra-Low-Power Speech Enhancement at the Edge"
-authors = [{ name = "Your Name" }]
-readme = "README.md"
-license = { text = "MIT" }
-requires-python = ">=3.10,<3.13"
-
-# Dependențele de bază ale proiectului (CPU by default).
-# Pentru GPU/CUDA instalezi roțile torch/torchaudio separat (ex. +cu121) după `uv sync`.
-dependencies = [
-  "torch==2.4.0",
-  "torchaudio==2.4.0",
-  "numpy==1.26.4",
-  "omegaconf==2.3.0",
-  "soundfile==0.12.1",
-  "resampy==0.4.3",
-  "onnx==1.16.2",
-  "onnxruntime==1.19.0",
-  "tqdm==4.66.4",
-  "pyyaml==6.0.2",
-]
-
-# Grupuri opționale (instalezi la nevoie: .[metrics], .[nonintrusive], .[video], .[dev])
-[project.optional-dependencies]
-metrics = [
-  "pystoi==0.3.3",
-  "pesq==0.0.4",
-]
-nonintrusive = [
-  "dnsmos==0.2.4",        # folosește onnxruntime
-  "nisqa==0.1.4",
-]
-video = [
-  "opencv-python==4.10.0.84",
-  "torchvision==0.19.0",
-]
-dev = [
-  "pytest==8.3.3",
-  "pytest-cov==5.0.0",
-  "ruff==0.6.9",
-  "mypy==1.11.2",
-  "pre-commit==3.8.0",
-]
-
-[project.scripts]
-# CLI-ul: comanda `se`
-se = "se_cli.cli:main"
-
-[build-system]
-requires = ["hatchling>=1.18"]
-build-backend = "hatchling.build"
-
-# uv: tratează proiectul ca pachet instalabil (instalează și entry-point-ul `se`)
-[tool.uv]
-package = true
-
-# Spune-i lui hatch ce pachete să includă în wheel (layout fără `src/`)
-[tool.hatch.build.targets.wheel]
-packages = [
-  "se_cli",
-  "datasets",
-  "se_models",
-  "metrics",
-  "runners",
-  "deploy",
-]
-
-# (opțional) exclude fișiere mari din wheel
-[tool.hatch.build]
-exclude = [
-  "data/**",
-  "**/.venv/**",
-  "**/__pycache__/**",
-  "**/.pytest_cache/**",
-  ".git/**",
-]
-
-# (opțional) configurări de calitate cod
 [tool.ruff]
-line-length = 100
 target-version = "py311"
-lint.select = ["E","F","I","B","UP"]
-lint.ignore = ["E203","E501"] # dacă preferi compat cu black
+line-length = 100
+exclude = [
+  "datasets/*",
+  "scripts/*",
+  "runners/export.py",  # acesta e YAML, nu Python
+]
 
-[tool.mypy]
-python_version = "3.11"
-ignore_missing_imports = true
-strict = false
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+  "E401","E701","E702",
+  "F401",
+  "I001",
+  "UP035","UP006","UP045","UP015",
+  "B905",
+]
