@@ -183,3 +183,192 @@ jobs:
               sys.exit(1)
           print("[gate] PASSED")
           PY
+
+  build_images:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+    needs: [lint_unit, metrics_unit]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR (push only on main)
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build CPU image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.cpu
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/${{ github.repository }}:cpu-${{ github.sha }}
+
+      - name: Build GPU image (optional)
+        if: hashFiles('docker/Dockerfile.gpu') != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.gpu
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/${{ github.repository }}:gpu-${{ github.sha }}
+
+  train_smoke:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+    needs: build_images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - name: Deps
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y libsndfile1
+          python -m pip install --upgrade pip
+          pip install "torch==2.3.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy pyyaml tensorboard soundfile
+      - name: Smoke train (1 epoch, tiny split)
+        env:
+          ULTRA_SMOKE: "1"
+        run: |
+          python runners/train.py --config configs/exp_mamba_unet.yaml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-checkpoints
+          path: artifacts/checkpoints/**
+
+  export_onnx_parity:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+    needs: train_smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - name: Deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install onnx onnxruntime "torch==2.3.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy soundfile
+      - name: Export ONNX
+        run: |
+          python deploy/export_onnx.py --ckpt artifacts/checkpoints/exp/model.ckpt --out artifacts/model.onnx
+      - name: Sanity ONNX
+        run: |
+          python deploy/sanity_onnx.py --onnx artifacts/model.onnx --print-json
+      - name: Parity check (quick)
+        run: |
+          python eval/bench_onnx.py --model artifacts/model.onnx --num-samples 4 --no-audio-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onnx-export
+          path: artifacts/model.onnx
+
+  infer_offline_score:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+    needs: export_onnx_parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - name: Deps
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y libsndfile1
+          python -m pip install --upgrade pip
+          pip install numpy soundfile pesq pystoi onnxruntime
+      - name: Infer offline + score
+        run: |
+          python runners/infer.py  --config configs/exp_mamba_unet.yaml --mode offline
+          python runners/score.py  --ref data/test/clean --est outputs/offline --out artifacts/metrics.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metrics-fp32
+          path: |
+            artifacts/metrics.json
+            outputs/offline/**
+
+  quantize_prune_rescore:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+    needs: infer_offline_score
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - name: Deps
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y libsndfile1
+          python -m pip install --upgrade pip
+          pip install numpy soundfile onnx onnxruntime
+      - name: Quantize + re-score
+        run: |
+          python deploy/quantize.py --onnx artifacts/model.onnx --weight-only --out artifacts/model_int8.onnx
+          python runners/infer.py --onnx artifacts/model_int8.onnx --mode offline
+          python runners/score.py --ref data/test/clean --est outputs/offline --out artifacts/metrics_int8.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metrics-int8
+          path: |
+            artifacts/model_int8.onnx
+            artifacts/metrics_int8.json
+
+  gate_metrics:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule' || github.event_name == 'pull_request'
+    needs: [infer_offline_score]
+    runs-on: ubuntu-latest
+    env:
+      THRESH_PESQ_WB: "3.00"
+      THRESH_STOI: "0.93"
+      THRESH_DELTA_SNR: "9.0"
+      THRESH_SI_SDR: "12.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download metrics
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics-fp32
+          path: artifacts_dl
+      - name: Gate vs thresholds
+        run: |
+          python - <<'PY'
+          import json,sys,os
+          m=json.load(open('artifacts_dl/artifacts/metrics.json'))
+          mm=m["metrics"]
+          thr={ "pesq_wb":float(os.environ["THRESH_PESQ_WB"]),
+                "stoi":float(os.environ["THRESH_STOI"]),
+                "delta_snr_db":float(os.environ["THRESH_DELTA_SNR"]),
+                "si_sdr_db":float(os.environ["THRESH_SI_SDR"]) }
+          fails=[]
+          if mm.get("pesq_wb",0)<thr["pesq_wb"]: fails.append(("pesq_wb",mm.get("pesq_wb"),thr["pesq_wb"]))
+          if mm.get("stoi",0)<thr["stoi"]: fails.append(("stoi",mm.get("stoi"),thr["stoi"]))
+          if mm.get("delta_snr_db",0)<thr["delta_snr_db"]: fails.append(("delta_snr_db",mm.get("delta_snr_db"),thr["delta_snr_db"]))
+          if mm.get("si_sdr_db",0)<thr["si_sdr_db"]: fails.append(("si_sdr_db",mm.get("si_sdr_db"),thr["si_sdr_db"]))
+          if fails:
+              print("GATE FAIL:", fails); sys.exit(1)
+          print("GATE PASS:", mm)
+          PY
+
+  hil_nightly:
+    if: github.event_name == 'schedule'
+    needs: [quantize_prune_rescore]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - name: HIL run (placeholder)
+        run: |
+          echo '{"device":"EDGE_XYZ","power_mw_avg":31.5}' > artifacts/hardware_report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hardware-report
+          path: artifacts/hardware_report.json
