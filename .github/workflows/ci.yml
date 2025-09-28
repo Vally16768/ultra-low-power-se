@@ -45,7 +45,6 @@ jobs:
         run: ruff check .
 
       - name: Mypy (typed subset)
-        # rulează pe subsetul definit în mypy.ini (secțiunea "files = ...")
         run: mypy --config-file mypy.ini --install-types --non-interactive
 
       - name: Pytest
@@ -91,3 +90,96 @@ jobs:
           path: |
             .pytest_cache
             **/.pytest_cache
+
+  # --- Etapa 2: opțional, rulează doar dacă există fișierele necesare ---
+
+  sanity_onnx:
+    runs-on: ubuntu-latest
+    needs: [lint_unit]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps (ONNX sanity)
+        run: |
+          python -m pip install --upgrade pip
+          pip install onnx onnxruntime numpy
+
+      - name: Find any ONNX in repo (optional)
+        id: findonnx
+        shell: bash
+        run: |
+          set -e
+          FILE=$(git ls-files '*.onnx' | head -n1 || true)
+          if [ -z "$FILE" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No ONNX found; skipping sanity check."
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=$FILE" >> "$GITHUB_OUTPUT"
+            echo "Found ONNX: $FILE"
+          fi
+
+      - name: Sanity check ONNX
+        if: steps.findonnx.outputs.found == 'true'
+        run: |
+          python deploy/sanity_onnx.py --onnx "${{ steps.findonnx.outputs.path }}"
+
+  gate_metrics:
+    runs-on: ubuntu-latest
+    needs: [metrics_unit]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate metrics.json against gates (optional)
+        shell: bash
+        run: |
+          set -e
+          METRICS="artifacts/metrics.json"
+          GATES=".github/gates.json"
+          if [ ! -f "$METRICS" ]; then
+            echo "No $METRICS present; skipping gate."
+            exit 0
+          fi
+
+          python - << 'PY'
+          import json, sys, os
+          METRICS=os.environ.get("METRICS","artifacts/metrics.json")
+          GATES=os.environ.get("GATES",".github/gates.json")
+
+          with open(METRICS) as f:
+              m=json.load(f)
+
+          # thresholds default (override with .github/gates.json if exists)
+          thr = {
+              "pesq_wb": 3.00,
+              "stoi": 0.93,
+              "delta_snr_db": 9.0,
+              "si_sdr_db": 12.0,
+          }
+          if os.path.exists(GATES):
+              try:
+                  thr.update(json.load(open(GATES)))
+              except Exception as e:
+                  print(f"[gate] warn: could not read {GATES}: {e}", file=sys.stderr)
+
+          metrics = m.get("metrics", m)  # accept either flat or nested
+          fails=[]
+          for k, t in thr.items():
+              v = float(metrics.get(k, float("-inf")))
+              ok = v >= t
+              print(f"[gate] {k}: {v:.4f} >= {t:.4f} ? {'OK' if ok else 'FAIL'}")
+              if not ok: fails.append((k, v, t))
+
+          if fails:
+              print(f"[gate] FAILED: {len(fails)} metric(s) below threshold: {fails}")
+              sys.exit(1)
+          print("[gate] PASSED")
+          PY
