@@ -247,11 +247,12 @@ def quantize_onnx_weight_only(in_model, out_model, keep_nodes=(), per_channel=Tr
         model_output=out_model,
         calibration_data_reader=reader,
         calibrate_method=CalibrationMethod.MinMax,
-        activation_type=QuantType.Float32,     # activări FP32
+        # scoate linia cu activation_type=...
         weight_type=QuantType.QInt8 if weight_symmetric else QuantType.QUInt8,
         per_channel=per_channel,
         nodes_to_exclude=list(keep_nodes),
-        quant_format=QuantFormat.QDQ
+        quant_format=QuantFormat.QDQ,
+        extra_options={"DisableActivationQuantization": True}  # dacă versiunea ta ORT o suportă
     )
     return out_model
 
