@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+MIXGEN="datasets/mixgen.py"
+[[ -f "$MIXGEN" ]] || MIXGEN="data/datasets/mixgen.py"
+if [[ ! -f "$MIXGEN" ]]; then
+  echo "[gen_mixes] ERROR: nu găsesc datasets/mixgen.py" >&2
+  exit 6
+fi
 
 # TRAIN
-python datasets/mixgen.py \
+python "$MIXGEN" \
   --clean-list data/lists/train_clean.txt \
   --noise-list data/lists/noise_train.txt \
   --rir-list   data/lists/rir_list.txt \
@@ -17,7 +26,7 @@ python datasets/mixgen.py \
   --seed 1337
 
 # DEV
-python datasets/mixgen.py \
+python "$MIXGEN" \
   --clean-list data/lists/dev_clean.txt \
   --noise-list data/lists/noise_dev.txt \
   --rir-list   data/lists/rir_list.txt \
@@ -32,7 +41,7 @@ python datasets/mixgen.py \
   --seed 2025
 
 # CHALLENGE – unseen
-python datasets/mixgen.py \
+python "$MIXGEN" \
   --clean-list data/lists/dev_clean.txt \
   --noise-list data/lists/noise_unseen.txt \
   --out-dir    data/prepared/test_challenge/unseen_noises \
@@ -43,7 +52,7 @@ python datasets/mixgen.py \
   --seed 404
 
 # CHALLENGE – OPUS
-python datasets/mixgen.py \
+python "$MIXGEN" \
   --clean-list data/lists/dev_clean.txt \
   --noise-list data/lists/noise_unseen.txt \
   --out-dir    data/prepared/test_challenge/opus16 \
@@ -53,7 +62,7 @@ python datasets/mixgen.py \
   --codec opus_16 \
   --seed 405
 
-python datasets/mixgen.py \
+python "$MIXGEN" \
   --clean-list data/lists/dev_clean.txt \
   --noise-list data/lists/noise_unseen.txt \
   --out-dir    data/prepared/test_challenge/opus24 \
@@ -64,7 +73,7 @@ python datasets/mixgen.py \
   --seed 406
 
 # CHALLENGE – clipping
-python datasets/mixgen.py \
+python "$MIXGEN" \
   --clean-list data/lists/dev_clean.txt \
   --noise-list data/lists/noise_unseen.txt \
   --out-dir    data/prepared/test_challenge/clipping_hard \
@@ -74,7 +83,7 @@ python datasets/mixgen.py \
   --clipping hard \
   --seed 407
 
-python datasets/mixgen.py \
+python "$MIXGEN" \
   --clean-list data/lists/dev_clean.txt \
   --noise-list data/lists/noise_unseen.txt \
   --out-dir    data/prepared/test_challenge/clipping_soft \
