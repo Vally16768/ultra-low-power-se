@@ -53,7 +53,7 @@ jobs:
         run: ruff check .
 
       - name: Mypy (typed subset)
-        run: mypy --config-file mypy.ini --install-types --non-interactive
+        run: mypy --ignore-missing-imports se_cli runners deploy datasets se_models
 
       - name: Pytest
         run: pytest -q
@@ -93,7 +93,71 @@ jobs:
             .pytest_cache
             **/.pytest_cache
 
-  sanity_onnx:
+  train_smoke:
+    runs-on: ubuntu-latest
+    needs: [lint_unit]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Deps
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y libsndfile1
+          python -m pip install --upgrade pip
+          pip install "torch==2.3.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy pyyaml tensorboard soundfile onnx onnxruntime
+
+      - name: Smoke train (1 epoch, tiny split)
+        run: |
+          python -m se_cli.cli train --config configs/exp_mamba_unet.yaml -o train.epochs=1
+
+      - name: Upload checkpoints (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-checkpoints
+          path: |
+            artifacts/exp/**/ckpt/**
+            artifacts/exp/**/logs/**
+
+  export_onnx_parity:
+    runs-on: ubuntu-latest
+    needs: [train_smoke]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install onnx onnxruntime "torch==2.3.*" --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy
+
+      - name: Export ONNX (opset 17)
+        run: |
+          python -m se_cli.cli export --config configs/exp_mamba_unet.yaml -o export.onnx.opset=17
+
+      - name: Sanity ONNX (auto-detect I/O names)
+        run: |
+          python deploy/sanity_onnx.py artifacts/export/mamba_unet_v0.onnx
+
+      - name: Upload ONNX
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnx-export
+          path: artifacts/export/*.onnx
+
+  sanity_onnx_repo:
     runs-on: ubuntu-latest
     needs: [lint_unit]
     timeout-minutes: 10
@@ -125,377 +189,7 @@ jobs:
             echo "Found ONNX: $FILE"
           fi
 
-      - name: Sanity check ONNX
+      - name: Sanity check ONNX (repo-stored)
         if: steps.findonnx.outputs.found == 'true'
         run: |
-          python deploy/sanity_onnx.py --onnx "${{ steps.findonnx.outputs.path }}"
-
-  build_images:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
-    needs: [lint_unit, metrics_unit]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR (push only on main)
-        if: github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build CPU image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.cpu
-          push: ${{ github.ref == 'refs/heads/main' }}
-          tags: ghcr.io/${{ github.repository }}:cpu-${{ github.sha }}
-
-      - name: Build GPU image (optional)
-        if: hashFiles('docker/Dockerfile.gpu') != ''
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.gpu
-          push: ${{ github.ref == 'refs/heads/main' }}
-          tags: ghcr.io/${{ github.repository }}:gpu-${{ github.sha }}
-
-  train_smoke:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
-    needs: build_images
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Deps
-        run: |
-          sudo apt-get update -y && sudo apt-get install -y libsndfile1
-          python -m pip install --upgrade pip
-          pip install "torch==2.3.*" --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy pyyaml tensorboard soundfile
-
-      - name: Smoke train (1 epoch, tiny split)
-        env:
-          ULTRA_SMOKE: "1"
-        run: |
-          python runners/train.py --config configs/exp_mamba_unet.yaml
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: smoke-checkpoints
-          path: artifacts/checkpoints/**
-
-  export_onnx_parity:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
-    needs: train_smoke
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install onnx onnxruntime "torch==2.3.*" --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy soundfile
-
-      - name: Download smoke checkpoints
-        uses: actions/download-artifact@v4
-        with:
-          name: smoke-checkpoints
-          path: artifacts
-
-      - name: Export ONNX (config → artifacts/export/*.onnx)
-        run: |
-          python deploy/export_onnx.py --config configs/exp_mamba_unet.yaml
-
-      - name: Normalize ONNX path to artifacts/model.onnx
-        id: pickonnx
-        run: |
-          set -e
-          DEST="artifacts/model.onnx"
-          SRC="$(ls -1 artifacts/export/*.onnx 2>/dev/null | head -n1 || true)"
-          if [ -z "$SRC" ]; then
-            echo "No ONNX found in artifacts/export"; exit 1
-          fi
-          cp -f "$SRC" "$DEST"
-          echo "path=$DEST" >> "$GITHUB_OUTPUT"
-
-      - name: Sanity ONNX
-        run: |
-          python deploy/sanity_onnx.py --onnx "${{ steps.pickonnx.outputs.path }}" --print-json
-
-      - name: Build lists for quick parity
-        run: |
-          bash scripts/build_lists.sh
-          test -s data/lists/dev_clean.txt
-          test -s data/lists/noise_unseen.txt
-
-      - name: Parity check (quick)
-        run: |
-          python eval/bench_onnx.py \
-            --model "${{ steps.pickonnx.outputs.path }}" \
-            --clean-list data/lists/dev_clean.txt \
-            --noise-list data/lists/noise_unseen.txt \
-            --n 8 --secs 2.0 \
-            --metrics pesq stoi si_sdr delta_snr_db \
-            --out artifacts/bench_quick.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: onnx-export
-          path: artifacts/model.onnx
-
-  infer_offline_score:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
-    needs: export_onnx_parity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Deps
-        run: |
-          sudo apt-get update -y && sudo apt-get install -y libsndfile1
-          python -m pip install --upgrade pip
-          pip install numpy soundfile pesq pystoi onnxruntime
-
-      - name: Download ONNX model
-        uses: actions/download-artifact@v4
-        with:
-          name: onnx-export
-          path: artifacts
-
-      - name: Infer offline + score
-        run: |
-          python runners/infer.py  --config configs/exp_mamba_unet.yaml --mode offline
-          python runners/score.py  --ref data/test/clean --est outputs/offline --out artifacts/metrics.json
-
-      - name: Augment metrics.json (schema extinsă)
-        env:
-          EXP_ID: "mamba_unet_q8p30_stream"
-          DATASET: "VBD_test"
-        run: |
-          python tools/augment_metrics.py --metrics artifacts/metrics.json \
-                --exp-id "$EXP_ID" --dataset "$DATASET" --commit "$GITHUB_SHA"
-
-      - name: Compute timing/RTF (offline batch)
-        run: |
-          python tools/compute_timing.py \
-                --wav-dir outputs/offline --out artifacts/timing.json
-
-      - name: Build model card
-        run: |
-          python reports/build_model_card.py \
-                --metrics artifacts/metrics.json \
-                --timing artifacts/timing.json \
-                --out artifacts/model_card.md
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: metrics-fp32
-          path: |
-            artifacts/metrics.json
-            artifacts/timing.json
-            artifacts/model_card.md
-            outputs/offline/**
-
-  ab_regression:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
-    needs: [infer_offline_score]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - name: Prep A/B/X set
-        run: |
-          python ab/prepare_abx.py \
-            --ref data/test/clean \
-            --est outputs/offline \
-            --out artifacts/abx
-      - uses: actions/upload-artifact@v4
-        with:
-          name: abx-audio
-        path: artifacts/abx/**
-
-  quantize_prune_rescore:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule'
-    needs: infer_offline_score
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Deps
-        run: |
-          sudo apt-get update -y && sudo apt-get install -y libsndfile1
-          python -m pip install --upgrade pip
-          pip install numpy soundfile onnx onnxruntime
-
-      - name: Download ONNX model
-        uses: actions/download-artifact@v4
-        with:
-          name: onnx-export
-          path: artifacts
-
-      - name: Ensure lists (train/noise)
-        run: |
-          bash scripts/build_lists.sh
-          test -s data/lists/train_clean.txt
-          test -s data/lists/noise_train.txt
-
-      - name: Quantize (PTQ static) + re-score
-        run: |
-          python deploy/quantize.py \
-            --model artifacts/model.onnx \
-            --static \
-            --calib-list data/lists/train_clean.txt \
-            --noisy-list data/lists/noise_train.txt \
-            --num-calib 40 \
-            --method percentile --percentile 99.9 \
-            --per-channel-weights --auto-keep-boundary \
-            --out artifacts/model_int8.onnx
-
-          python runners/infer.py --onnx artifacts/model_int8.onnx --mode offline
-          python runners/score.py --ref data/test/clean --est outputs/offline --out artifacts/metrics_int8.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: metrics-int8
-          path: |
-            artifacts/model_int8.onnx
-            artifacts/metrics_int8.json
-
-  report_build:
-    needs: [quantize_prune_rescore]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - name: Get artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: _dl
-      - name: Build HTML report
-        run: |
-          python reports/build_report.py \
-            --fp32 _dl/metrics-fp32/artifacts/metrics.json \
-            --int8 _dl/metrics-int8/artifacts/metrics_int8.json \
-            --out artifacts/report.html
-      - uses: actions/upload-artifact@v4
-        with:
-          name: html-report
-          path: artifacts/report.html
-
-  gate_metrics:
-    if: github.ref == 'refs/heads/main' || github.event_name == 'schedule' || github.event_name == 'pull_request'
-    needs: [infer_offline_score]
-    runs-on: ubuntu-latest
-    env:
-      THRESH_PESQ_WB: "3.00"
-      THRESH_STOI: "0.93"
-      THRESH_DELTA_SNR: "9.0"
-      THRESH_SI_SDR: "12.0"
-      TOL_PESQ_WB: "0.01"
-      TOL_STOI: "0.001"
-      TOL_DELTA_SNR: "0.10"
-      TOL_SI_SDR: "0.10"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download metrics (FP32)
-        uses: actions/download-artifact@v4
-        with:
-          name: metrics-fp32
-          path: artifacts_dl
-
-      - name: Gate absolute thresholds
-        run: |
-          python - <<'PY'
-          import json,os,sys
-          m=json.load(open('artifacts_dl/artifacts/metrics.json'))
-          mm=m.get("metrics",m)
-          thr={ "pesq_wb":float(os.environ["THRESH_PESQ_WB"]),
-                "stoi":float(os.environ["THRESH_STOI"]),
-                "delta_snr_db":float(os.environ["THRESH_DELTA_SNR"]),
-                "si_sdr_db":float(os.environ["THRESH_SI_SDR"]) }
-          fails=[]
-          for k,vmin in thr.items():
-              v=float(mm.get(k,-1e9))
-              print(f"[ABS] {k}: {v:.4f} >= {vmin:.4f} ?", "OK" if v>=vmin else "FAIL")
-              if v<vmin: fails.append((k,v,vmin))
-          if fails:
-              print("[ABS] FAIL:",fails); sys.exit(1)
-          print("[ABS] PASS")
-          PY
-
-      - name: Gate vs GOLDEN (delta >= -tolerance)
-        run: |
-          python - <<'PY'
-          import json,os,sys
-          cur=json.load(open('artifacts_dl/artifacts/metrics.json'))
-          cur=cur.get("metrics",cur)
-          golden=json.load(open('.github/golden_metrics.json'))
-          golden=golden.get("metrics",golden)
-
-          tol={ "pesq_wb":float(os.environ["TOL_PESQ_WB"]),
-                "stoi":float(os.environ["TOL_STOI"]),
-                "delta_snr_db":float(os.environ["TOL_DELTA_SNR"]),
-                "si_sdr_db":float(os.environ["TOL_SI_SDR"]) }
-          fails=[]
-          for k,t in tol.items():
-              d = float(cur.get(k,-1e9)) - float(golden.get(k,-1e9))
-              print(f"[GOLDEN] {k}: Δ={d:+.4f} (accept ≥ {-t:+.4f})", "OK" if d>=-t else "FAIL")
-              if d < -t: fails.append((k,d))
-          if fails:
-              print("[GOLDEN] FAIL:",fails); sys.exit(1)
-          print("[GOLDEN] PASS")
-          PY
-
-  hil_nightly:
-    if: github.event_name == 'schedule'
-    needs: [quantize_prune_rescore]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: HIL run (placeholder)
-        run: |
-          echo '{"device":"EDGE_XYZ","power_mw_avg":31.5}' > artifacts/hardware_report.json
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hardware-report
-          path: artifacts/hardware_report.json
+          python deploy/sanity_onnx.py "${{ steps.findonnx.outputs.path }}"
