@@ -32,3 +32,40 @@ LibriSpeech/
 VoiceBank_DEMAND/
 data/
 artifacts/
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+.dist/
+build/
+.eggs/
+.ipynb_checkpoints/
+
+# Envs
+.venv/
+.env/
+.env.*
+.uv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Data & artifacts
+/data/
+data/
+artifacts/
+results/
+reports/
+logs/
+wandb/
+runs/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

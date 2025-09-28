@@ -1,1 +1,10 @@
-# requirements.txt (frozen with hashes)
+# Pin lightweight essentials; install PyTorch separately per platform
+numpy>=1.24
+soundfile>=0.12
+librosa>=0.10
+pyyaml>=6.0
+onnx>=1.16
+onnxruntime>=1.18
+pytest>=8.0
+ruff>=0.6
+mypy>=1.8

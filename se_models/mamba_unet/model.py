@@ -22,9 +22,11 @@ class TinyMambaUNetStub(nn.Module):
         e2 = self.enc2(e1)
         b  = self.bott(e2)
         d1 = self.dec1(b)
-        # align shapes (în caz de off-by-one la deconvoluție)
-        if d1.size(-1) != e1.size(-1):
-            d1 = nn.functional.pad(d1, (0, e1.size(-1)-d1.size(-1)))
+        diff = e1.size(-1) - d1.size(-1)
+        if diff > 0:
+            d1 = nn.functional.pad(d1, (0, diff))
+        elif diff < 0:
+            d1 = d1[..., :e1.size(-1)]
         y  = self.out(d1 + e1)
         return y.squeeze(1)
 
