@@ -1,5 +1,15 @@
 .PHONY: help setup test lint fmt data-train train export infer eval onnx-sanity
 
+.PHONY: clean clean-all clean-tb
+clean:
+	@scripts/cleanup.sh --yes
+
+clean-all:
+	@scripts/cleanup.sh --aggressive --yes
+
+clean-tb:
+	@scripts/cleanup.sh --only tb --yes
+
 help:
 	@echo "Targets:"
 	@echo "  setup        - create venv & install deps"
@@ -10,6 +20,9 @@ help:
 	@echo "  train        - run training via se"
 	@echo "  export       - export ONNX"
 	@echo "  onnx-sanity  - parity Torch vs ONNX"
+	@echo "  clean        - remove artifacts (not models)"
+	@echo "  clean-all    - remove all artifacts (including models)"
+	@echo "  clean-tb     - remove TensorBoard logs"
 
 setup:
 	python3 -m venv .venv && . .venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt
