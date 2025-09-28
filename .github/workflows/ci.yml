@@ -77,10 +77,10 @@ jobs:
       - name: Install Python deps (metrics)
         run: |
           python -m pip install --upgrade pip
-          pip install numpy soundfile pesq pystoi onnxruntime
+          pip install pytest numpy soundfile pesq pystoi onnxruntime
 
       - name: Pytest (metrics fixtures)
-        run: pytest -q tests/test_metrics_fixtures.py
+        run: python -m pytest -q tests/test_metrics_fixtures.py
 
       - name: Upload pytest reports (optional)
         if: always()
