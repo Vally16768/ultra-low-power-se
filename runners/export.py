@@ -1,19 +1,22 @@
-inference:
-  stream_io:
-    state_in:  ["s1_in","s2_in"]
-    state_out: ["s1_out","s2_out"]
-export:
-  onnx:
-    dynamic_axes:
-      "s1_in":  {0: "B"}
-      "s1_out": {0: "B"}
-      "s2_in":  {0: "B"}
-      "s2_out": {0: "B"}
-    inputs:
-      - name: "noisy"
-      - name: "s1_in"
-      - name: "s2_in"
-    outputs:
-      - name: "enhanced"
-      - name: "s1_out"
-      - name: "s2_out"
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import yaml  # type: ignore[import-untyped]
+
+from deploy.export_onnx import export_onnx
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True, help="YAML config pt. export")
+    args = ap.parse_args()
+
+    cfg_text = Path(args.config).read_text(encoding="utf-8")
+    cfg = yaml.safe_load(cfg_text) or {}
+    export_onnx(cfg)
+
+
+if __name__ == "__main__":
+    main()
