@@ -1,5 +1,5 @@
 # eval/bench_onnx.py
-# Bench calitate & viteză pentru ONNX — fără dependențe grele (pesq/pystoi sunt opționale).
+# Bench calitate & viteză pentru ONNX — fără dependențe grele (pesq/pystoi opționale).
 import argparse, json, time, random
 from pathlib import Path
 import numpy as np
@@ -84,12 +84,25 @@ def load_rand(paths, target_len, sr):
     # else exact
     return _sanitize(x[:target_len])
 
-# ------------------------- mix corect fizic -------------------------
+# ------------------------- niveluri & mix -------------------------
+
+def rms_dbfs(x, eps=1e-12):
+    """RMS în dBFS pentru semnale float în [-1, 1] (convențional)."""
+    rms = float(np.sqrt(np.mean(x.astype(np.float32) ** 2) + eps))
+    return 20.0 * np.log10(rms + eps)
+
+def apply_rms_target(x, target_dbfs=-26.0, eps=1e-12):
+    """Rescalează x la RMS target_dbfs dBFS (dacă x are energie)."""
+    x = x.astype(np.float32, copy=False)
+    cur = rms_dbfs(x, eps=eps)
+    gain_db = float(target_dbfs - cur)
+    gain = 10.0 ** (gain_db / 20.0)
+    y = x * gain
+    return y.astype(np.float32)
 
 def mix(clean, noise, snr_db=5.0, peak_norm=0.0, eps=1e-12):
     """
     Amestec corect fizic: k astfel încât 20*log10(||clean|| / ||k*noise||) = snr_db.
-    Fără standardizare; opțional normalizează vârful semnalului rezultat.
     """
     clean = clean.astype(np.float32, copy=False)
     noise = noise.astype(np.float32, copy=False)
@@ -118,8 +131,12 @@ def main():
     ap.add_argument("--threads", type=int, default=0, help="intra_op_num_threads; 0=ORT default")
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--seed", type=int, default=404)
-    ap.add_argument("--peak-norm", type=float, default=0.0,
+    ap.add_argument("--peak-norm", type=float, default=0.95,
                     help="dacă >0, scalează mixul la acest vârf (ex. 0.95) pt. a evita clipping")
+    ap.add_argument("--rms-target", type=float, default=-26.0,
+                    help="dBFS țintă pt. clean & noise înainte de mix; setează 0 pentru a dezactiva")
+    ap.add_argument("--level-both", action="store_true",
+                    help="dacă e setat, aplică RMS target la ambele semnale înainte de mix")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -147,11 +164,16 @@ def main():
     for _ in range(args.warmup):
         _ = sess.run([outp], {inp: dummy})
 
-    # bucla principală
     snr_choices = [-5, 0, 5, 10]
     for _ in range(args.n):
         c = load_rand(clean_paths, L, args.sr)
         n = load_rand(noise_paths, L, args.sr)
+
+        # opțional: nivelare RMS înainte de mix (conform trainingului obișnuit)
+        if args.level_both and args.rms_target != 0:
+            c = apply_rms_target(c, args.rms_target)
+            n = apply_rms_target(n, args.rms_target)
+
         noisy, clean = mix(c, n, snr_db=random.choice(snr_choices), peak_norm=args.peak_norm)
 
         x = noisy[None, None, :].astype("float32")
