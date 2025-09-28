@@ -22,6 +22,7 @@ __pycache__/
 *.swp
 
 # Output / build
+results/
 dist/
 build/
 *.egg-info/
