@@ -45,7 +45,49 @@ jobs:
         run: ruff check .
 
       - name: Mypy (typed subset)
+        # rulează pe subsetul definit în mypy.ini (secțiunea "files = ...")
         run: mypy --config-file mypy.ini --install-types --non-interactive
 
       - name: Pytest
         run: pytest -q
+
+  metrics_unit:
+    runs-on: ubuntu-latest
+    needs: lint_unit
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System deps (libsndfile for soundfile)
+        shell: bash
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y libsndfile1
+          else
+            apt-get update -y
+            apt-get install -y libsndfile1
+          fi
+
+      - name: Install Python deps (metrics)
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy soundfile pesq pystoi onnxruntime
+
+      - name: Pytest (metrics fixtures)
+        run: pytest -q tests/test_metrics_fixtures.py
+
+      - name: Upload pytest reports (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-unit-logs
+          path: |
+            .pytest_cache
+            **/.pytest_cache
