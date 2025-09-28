@@ -1,0 +1,11 @@
+{
+  "exp_id": "golden_baseline",
+  "commit": "golden123",
+  "dataset": "VBD_test",
+  "metrics": {
+    "pesq_wb": 3.10,
+    "stoi": 0.940,
+    "delta_snr_db": 11.0,
+    "si_sdr_db": 12.5
+  }
+}
