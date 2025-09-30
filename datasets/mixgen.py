@@ -1,7 +1,8 @@
 from __future__ import annotations
-import argparse, json, os, random, math, subprocess, uuid, csv
+import argparse, json, os, random, math, subprocess, uuid, csv, tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Tuple
 import numpy as np
 import soundfile as sf
 
@@ -30,25 +31,53 @@ def convolve_rir(x, rir):
     return y / (g+1e-12)
 
 def apply_clipping(x, mode="hard", thr=0.95):
-    if mode=="hard": return np.clip(x, -thr, thr)
+    if mode == "hard": return np.clip(x, -thr, thr)
     return np.tanh(x / thr)
 
 def apply_opus_codec(x, sr, kbps=16):
-    tid = uuid.uuid4().hex
-    tmp_in  = f"/tmp/{tid}_in.wav"
-    tmp_out = f"/tmp/{tid}_out.wav"
-    sf.write(tmp_in, x, sr)
-    subprocess.run([
-        "ffmpeg","-y","-loglevel","error",
-        "-i", tmp_in, "-c:a","libopus","-b:a", f"{kbps}k", tmp_out
-    ], check=True)
-    y, s = sf.read(tmp_out, dtype="float32")
-    os.remove(tmp_in); os.remove(tmp_out)
-    if s != sr:
-        import resampy
-        y = resampy.resample(y, s, sr)
-    if y.ndim>1: y=y.mean(-1)
-    return y
+    """
+    Encodeaza prin libopus intr-un container .opus (Ogg) si decodeaza inapoi in WAV,
+    pentru a simula degradarea de codec. Evita scrierea libopus catre .wav.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tid = uuid.uuid4().hex
+        tmp_in_wav  = os.path.join(td, f"{tid}_in.wav")
+        tmp_opus    = os.path.join(td, f"{tid}.opus")
+        tmp_out_wav = os.path.join(td, f"{tid}_out.wav")
+
+        # scrie intrarea
+        sf.write(tmp_in_wav, x, sr)
+
+        # encode → .opus (Ogg/Opus)
+        try:
+            subprocess.run(
+                ["ffmpeg","-y","-loglevel","error",
+                 "-i", tmp_in_wav,
+                 "-c:a","libopus","-b:a", f"{kbps}k",
+                 tmp_opus],
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"ffmpeg opus encode failed (is libopus available?): {e}")
+
+        # decode → WAV (pcm_s16le, 1ch, sr)
+        try:
+            subprocess.run(
+                ["ffmpeg","-y","-loglevel","error",
+                 "-i", tmp_opus,
+                 "-c:a","pcm_s16le","-ar", str(sr), "-ac","1",
+                 tmp_out_wav],
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"ffmpeg decode back to wav failed: {e}")
+
+        y, s = sf.read(tmp_out_wav, dtype="float32", always_2d=False)
+        if s != sr:
+            import resampy
+            y = resampy.resample(y, s, sr)
+        if y.ndim > 1: y = y.mean(-1)
+        return y
 
 @dataclass
 class MixMeta:
@@ -95,7 +124,7 @@ def mix_one(clean, noise, sr, snr_db, rir_path=None, codec=None, codec_kbps=None
     y = c + n * noise_gain
 
     if codec in ("opus_16","opus_24"):
-        kbps = 16 if codec=="opus_16" else 24
+        kbps = 16 if codec == "opus_16" else 24
         y = apply_opus_codec(y, sr, kbps)
         y = norm_len(y, target_len)
 
