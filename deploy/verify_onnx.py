@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 """
 Verifică un model ONNX:
   - onnx.checker.check_model
