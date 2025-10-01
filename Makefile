@@ -27,14 +27,15 @@ RIRS_ROOT        ?= /data/RIRS_NOISES
 
 # Fişiere/dirs utilizate de ținte
 REQ_FILE   ?= requirements.txt
-ONNX_PATH  ?= artifacts/export/mamba_unet_v0.onnx
 CFG_TRAIN  ?= configs/exp_mamba_unet.yaml
+ONNX_PATH  ?= artifacts/export/mamba_unet_auto.onnx
 
 # ---------- Phony ----------
 .PHONY: help setup setup-dev ensure-venv \
         test lint fmt \
         data-train datasets datasets.verify datasets.clean \
-        train export infer eval onnx-sanity \
+        train export onnx onnx-verify onnx-verify-sim onnx-sanity \
+        infer eval \
         clean clean-all clean-tb
 
 # ---------- Help ----------
@@ -50,11 +51,12 @@ help:
 > @echo "  datasets.verify    - verify generated datasets integrity"
 > @echo "  datasets.clean     - remove only generated mixes (data/prepared/*)"
 > @echo "  train              - run training via se_cli"
-> @echo "  export             - export ONNX"
-> @echo "  onnx-sanity        - parity Torch vs ONNX"
-> @echo "  clean              - remove artifacts (not models)"
-> @echo "  clean-all          - remove all artifacts (including models)"
-> @echo "  clean-tb           - remove TensorBoard logs"
+> @echo "  export             - export ONNX (robust, static, input=noisy, out=[B,1,T])"
+> @echo "  onnx               - alias pt. onnx-verify"
+> @echo "  onnx-verify        - verify ONNX vs PyTorch outputs"
+> @echo "  onnx-verify-sim    - verify ONNX (sim)"
+> @echo "  onnx-sanity        - parity Torch vs ONNX (script extra)"
+> @echo "  clean / clean-all / clean-tb"
 
 # ---------- Env / Deps ----------
 ensure-venv:
@@ -66,7 +68,6 @@ setup: ensure-venv
 > $(ACTIVATE) && python -m pip install --upgrade pip
 > $(ACTIVATE) && pip install -r $(REQ_FILE)
 
-# Simplu și stabil: instalează direct uneltele de dev (dacă sunt deja, le actualizează)
 setup-dev: ensure-venv
 > $(ACTIVATE) && pip install -U pip ruff mypy pytest
 
@@ -85,9 +86,7 @@ fmt:
 data-train:
 > bash scripts/build_vbd_pairs.sh
 
-# ---------- Datasets Orchestration (automat, idempotent) ----------
-# NOTE: scripts/make_dataset.sh orchestrează tot (prepare_dirs, prepare_librispeech,
-# prepare_noises, build_vbd_pairs, gen_mixes). Citește LIBRISPEECH_ROOT/DEMAND_ROOT/RIRS_ROOT.
+# ---------- Datasets Orchestration ----------
 datasets:
 > bash scripts/make_dataset.sh \
 >   --librispeech "$(LIBRISPEECH_ROOT)" \
@@ -105,7 +104,22 @@ train:
 > $(ACTIVATE) && python -m se_cli.cli train --config $(CFG_TRAIN)
 
 export:
-> $(ACTIVATE) && python -m se_cli.cli export --config $(CFG_TRAIN)
+> $(ACTIVATE) && python deploy/export_onnx_min.py \
+>   --model se_models.mamba_unet.model:build_model \
+>   --config $(CFG_TRAIN) \
+>   --out $(ONNX_PATH) \
+>   --opset 17 --dynamic 0 \
+>   --input-name noisy \
+>   --keep-ch 1
+
+# ---------- ONNX Verify ----------
+onnx: onnx-verify
+
+onnx-verify:
+> $(ACTIVATE) && python deploy/verify_onnx.py $(ONNX_PATH) --config $(CFG_TRAIN)
+
+onnx-verify-sim:
+> $(ACTIVATE) && python deploy/verify_onnx.py $(ONNX_PATH:.onnx=.sim.onnx) --config $(CFG_TRAIN)
 
 onnx-sanity:
 > $(ACTIVATE) && python deploy/sanity_onnx.py $(ONNX_PATH)
