@@ -1,4 +1,4 @@
-import sys, argparse
+import sys, argparse, json, os, inspect
 from typing import Dict, List
 from se_cli.config import load_config
 
@@ -47,7 +47,18 @@ def main(argv: List[str] | None = None):
 
     cfg = load_config(gargs.config, overrides)
     run = _get_runner(cmd)
-    return run(cfg)
+
+    # adaptor: dacă runner-ul primește cfg, îl pasăm; altfel trecem info prin env și chemăm fără arg.
+    try:
+        sig = inspect.signature(run)
+        if len(sig.parameters) == 1:
+            return run(cfg)
+    except (TypeError, ValueError):
+        pass
+
+    os.environ["SE_CONFIG_PATH"] = gargs.config
+    os.environ["SE_CONFIG_OVERRIDES_JSON"] = json.dumps(overrides)
+    return run()
 
 if __name__ == "__main__":
     main()

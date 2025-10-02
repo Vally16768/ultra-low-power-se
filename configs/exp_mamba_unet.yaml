@@ -4,24 +4,32 @@ experiment:
 
 data:
   sample_rate: 16000
+  train_manifest: data/prepared/train_mixes/manifests/pairs.csv
+  val_manifest:   data/prepared/dev_mixes/manifests/pairs.csv
 
 model:
+  module: se_models.mamba_unet.model   # <<— importă direct modulul dorit
   name: mamba_unet
   in_ch: 1
   base: 32
 
 train:
-  epochs: 3
+  epochs: 50
   batch_size: 8
-  lr: 1.0e-3
+  lr: 2.0e-4
+  segment_sec: 4.0
+  seed: 1337
 
-inference:
-  frame_ms: 20
-  seconds: 1
-  out_wav: artifacts/demo_out.wav
+  # ===== Adaptive LR (ReduceLROnPlateau pe val_loss) =====
+  scheduler:
+    mode: min         # monitorizează 'val_loss'
+    factor: 0.5       # înjumătățește LR
+    patience: 5       # așteaptă 5 epoci fără îmbunătățire
+    min_lr: 1.0e-6
+    cooldown: 0
+    verbose: true
 
-export:
-  name: mamba_unet_v0
-  out_dir: artifacts/export
-  onnx:
-    opset: 17
+  # ===== Early Stopping (bazat pe val_loss) =====
+  early_stopping:
+    patience: 10      # oprește dacă nu se îmbunătățește ≥ min_delta în 10 epoci
+    min_delta: 0.0

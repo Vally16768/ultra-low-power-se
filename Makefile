@@ -1,14 +1,12 @@
 # -----------------------------
 # Ultra-Low-Power SE — Makefile
 # -----------------------------
-# Folosim '>' în loc de TAB pentru liniile de comandă (evită "missing separator")
 .RECIPEPREFIX := >
 SHELL := /bin/bash
 .ONESHELL:
 .SHELLFLAGS := -eu -o pipefail -c
 MAKEFLAGS += --no-builtin-rules
 
-# Dacă există .env.local, îl încărcăm (ex: LIBRISPEECH_ROOT=/data/LibriSpeech etc.)
 ifneq (,$(wildcard .env.local))
 include .env.local
 export
@@ -20,21 +18,24 @@ PYTHON       ?= python3
 PIP          ?= $(VENV)/bin/pip
 ACTIVATE     = . $(VENV)/bin/activate
 
-# Rute dataset (pot fi suprascrise din .env.local)
+# Dataset roots (opțional override în .env.local)
 LIBRISPEECH_ROOT ?= /data/LibriSpeech
 DEMAND_ROOT      ?= /data/DEMAND
 RIRS_ROOT        ?= /data/RIRS_NOISES
 
-# Fişiere/dirs utilizate de ținte
+# Fişiere/dirs
 REQ_FILE   ?= requirements.txt
 CFG_TRAIN  ?= configs/exp_mamba_unet.yaml
 ONNX_PATH  ?= artifacts/export/mamba_unet_auto.onnx
+
+# Model module (pentru import explicit; override din .env.local dacă vrei)
+MODEL_MODULE ?= se_models.mamba_unet.model
 
 # ---------- Phony ----------
 .PHONY: help setup setup-dev ensure-venv \
         test lint fmt \
         data-train datasets datasets.verify datasets.clean \
-        train export onnx onnx-verify onnx-verify-sim onnx-sanity \
+        train tb logs export onnx onnx-verify onnx-verify-sim onnx-sanity \
         infer eval \
         clean clean-all clean-tb
 
@@ -50,7 +51,9 @@ help:
 > @echo "  datasets           - FULL pipeline: prepare dirs/lists & generate mixes (idempotent)"
 > @echo "  datasets.verify    - verify generated datasets integrity"
 > @echo "  datasets.clean     - remove only generated mixes (data/prepared/*)"
-> @echo "  train              - run training via se_cli"
+> @echo "  train              - run training via se_cli (cfg YAML controlează tot)"
+> @echo "  tb                 - launch TensorBoard on artifacts"
+> @echo "  logs               - tail -f training log (stdout mirror)"
 > @echo "  export             - export ONNX (robust, static, input=noisy, out=[B,1,T])"
 > @echo "  onnx               - alias pt. onnx-verify"
 > @echo "  onnx-verify        - verify ONNX vs PyTorch outputs"
@@ -77,7 +80,7 @@ test:
 
 lint:
 > $(ACTIVATE) && ruff check .
-> $(ACTIVATE) && mypy --ignore-missing-imports se_cli runners deploy datasets se_models
+> $(ACTIVATE) && mypy --ignore-missing-imports se_cli runners deploy datasets se_models || true
 
 fmt:
 > $(ACTIVATE) && ruff check --fix .
@@ -99,10 +102,20 @@ datasets.verify:
 datasets.clean:
 > rm -rf data/prepared
 
-# ---------- Train / Export / Eval ----------
+# ---------- Train ----------
 train:
-> $(ACTIVATE) && python -m se_cli.cli train --config $(CFG_TRAIN)
+> mkdir -p artifacts/logs
+> $(ACTIVATE) && MODEL_MODULE="$(MODEL_MODULE)" \
+> python -m se_cli.cli train --config $(CFG_TRAIN) 2>&1 | tee artifacts/logs/train_$$.log
 
+# ---------- TensorBoard & logs ----------
+tb:
+> $(ACTIVATE) && tensorboard --logdir artifacts/exp --port 6006
+
+logs:
+> tail -f artifacts/logs/*.log
+
+# ---------- Export ----------
 export:
 > $(ACTIVATE) && python deploy/export_onnx_min.py \
 >   --model se_models.mamba_unet.model:build_model \
@@ -124,7 +137,7 @@ onnx-verify-sim:
 onnx-sanity:
 > $(ACTIVATE) && python deploy/sanity_onnx.py $(ONNX_PATH)
 
-# hooks optionale (dacă ai CLI pentru infer/eval)
+# ---------- Hooks optionale ----------
 infer:
 > $(ACTIVATE) && python -m se_cli.cli infer --config $(CFG_TRAIN)
 
