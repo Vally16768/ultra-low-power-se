@@ -34,17 +34,20 @@ else
 fi
 
 # --- 2) Zgomote sintetice (white/pink/brown/babble) ---
-# Detectăm corect calea scriptului (poate fi în repo la rădăcină sau sub data/)
-SYNTH_SCRIPT="datasets/make_synth_noises.py"
-if [[ ! -f "$SYNTH_SCRIPT" ]]; then
-  if [[ -f "data/datasets/make_synth_noises.py" ]]; then
-    SYNTH_SCRIPT="data/datasets/make_synth_noises.py"
-  else
-    echo "[prepare_noises] ERROR: nu găsesc datasets/make_synth_noises.py" >&2
-    exit 5
-  fi
+SYNTH_CANDIDATES=(
+  "datasets/make_synth_noises.py"
+  "data/datasets/make_synth_noises.py"
+  "make_synth_noises.py"           # <<— NEW: rădăcina repo-ului
+  "scripts/make_synth_noises.py"   # <<— NEW: dacă îl ții în scripts/
+)
+SYNTH_SCRIPT=""
+for c in "${SYNTH_CANDIDATES[@]}"; do
+  [[ -f "$c" ]] && { SYNTH_SCRIPT="$c"; break; }
+done
+if [[ -z "$SYNTH_SCRIPT" ]]; then
+  echo "[prepare_noises] ERROR: nu găsesc make_synth_noises.py" >&2
+  exit 5
 fi
-
 python "$SYNTH_SCRIPT"
 
 # listă sintetice
