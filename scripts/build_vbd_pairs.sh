@@ -29,33 +29,37 @@ echo "  train noisy: ${TRAIN_NOISY:-<missing>}"
 echo "  test  clean: ${TEST_CLEAN:-<missing>}"
 echo "  test  noisy: ${TEST_NOISY:-<missing>}"
 
-[[ -z "${TEST_CLEAN:-}" || -z "${TEST_NOISY:-}" ]] && { echo "[ERROR] lipsesc folderele test"; exit 2; }
+if [[ -z "${TEST_CLEAN:-}" || -z "${TEST_NOISY:-}" ]]; then
+  echo "[ERROR] lipsesc folderele test"; exit 2
+fi
 
-# Scrie test.csv + listă compat
+# --- FIX: export către Python ---
+export VBD_ROOT TRAIN_CLEAN TRAIN_NOISY TEST_CLEAN TEST_NOISY
+
 python3 - <<'PY'
 import os, csv, glob
 VBD=os.environ["VBD_ROOT"]
+
 def pairs(n_dir, c_dir):
-  nd={os.path.basename(p):p for p in glob.glob(os.path.join(n_dir,"**","*.wav"),recursive=True)}
-  cd={os.path.basename(p):p for p in glob.glob(os.path.join(c_dir,"**","*.wav"),recursive=True)}
-  common=sorted(set(nd)&set(cd))
-  return [(nd[k],cd[k]) for k in common]
+    nd={os.path.basename(p):p for p in glob.glob(os.path.join(n_dir,"**","*.wav"), recursive=True)}
+    cd={os.path.basename(p):p for p in glob.glob(os.path.join(c_dir,"**","*.wav"), recursive=True)}
+    common=sorted(set(nd)&set(cd))
+    return [(nd[k], cd[k]) for k in common]
 
 test_pairs = pairs(os.environ["TEST_NOISY"], os.environ["TEST_CLEAN"])
 with open(os.path.join(VBD,"test.csv"),"w",newline="") as f:
-  w=csv.writer(f); w.writerow(["noisy","clean"]); w.writerows(test_pairs)
+    w=csv.writer(f); w.writerow(["noisy","clean"]); w.writerows(test_pairs)
 
 # listă compat (noisy,clean,meta) pt. tool-uri vechi
 with open("data/lists/vbd_pairs_test.csv","w",newline="") as f:
-  w=csv.writer(f); w.writerow(["noisy","clean","meta"]); w.writerows([(*p,"") for p in test_pairs])
+    w=csv.writer(f); w.writerow(["noisy","clean","meta"]); w.writerows([(*p,"") for p in test_pairs])
 
-# train (dacă există folderele)
-tc, tn = os.environ.get("TRAIN_CLEAN"), os.environ.get("TRAIN_NOISY")
+tc=os.environ.get("TRAIN_CLEAN"); tn=os.environ.get("TRAIN_NOISY")
 if tc and tn:
-  train_pairs = pairs(tn, tc)
-  with open(os.path.join(VBD,"train.csv"),"w",newline="") as f:
-    w=csv.writer(f); w.writerow(["noisy","clean"]); w.writerows(train_pairs)
-  print(f"[VBD] train pairs: {len(train_pairs)}")
+    train_pairs = pairs(tn, tc)
+    with open(os.path.join(VBD,"train.csv"),"w",newline="") as f:
+        w=csv.writer(f); w.writerow(["noisy","clean"]); w.writerows(train_pairs)
+    print(f"[VBD] train pairs: {len(train_pairs)}")
 print(f"[VBD] test  pairs: {len(test_pairs)}")
 PY
 

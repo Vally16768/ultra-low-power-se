@@ -1,43 +1,60 @@
+#!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, os, random, math, subprocess, uuid, csv, tempfile
+import argparse, json, os, random, math, subprocess, uuid, csv, tempfile, sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Tuple
 import numpy as np
 import soundfile as sf
 
-def set_seed(seed:int):
+# ---------------- Utils ----------------
+def set_seed(seed: int):
     import numpy as _np, random as _rnd, os as _os
-    _os.environ["PYTHONHASHSEED"]=str(seed); _rnd.seed(seed); _np.random.seed(seed)
+    _os.environ["PYTHONHASHSEED"] = str(seed)
+    _rnd.seed(seed)
+    _np.random.seed(seed)
 
-def rms(x): return np.sqrt(np.mean(np.maximum(1e-12, x**2)))
-def norm_len(x, n):
-    if len(x) == n: return x
-    if len(x) > n:  return x[:n]
-    y = np.zeros(n, dtype=x.dtype); y[:len(x)] = x; return y
+def rms(x: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.maximum(1e-12, x**2))))
 
-def load_wav(path, sr):
-    x, s = sf.read(path, dtype="float32", always_2d=False)
-    if x.ndim > 1: x = x.mean(-1)
+def norm_len(x: np.ndarray, n: int) -> np.ndarray:
+    if len(x) == n:
+        return x
+    if len(x) > n:
+        return x[:n]
+    y = np.zeros(n, dtype=x.dtype)
+    y[:len(x)] = x
+    return y
+
+def load_wav(path: str | Path, sr: int) -> np.ndarray:
+    x, s = sf.read(str(path), dtype="float32", always_2d=False)
+    if x.ndim > 1:
+        x = x.mean(-1)
     if s != sr:
         import resampy
         x = resampy.resample(x, s, sr)
-    return x
+    return x.astype(np.float32, copy=False)
 
-def convolve_rir(x, rir):
-    y = np.convolve(x, rir, mode="full")
-    y = y[:len(x)]
-    g = rms(y) / (rms(x)+1e-12)
-    return y / (g+1e-12)
+def convolve_rir(x: np.ndarray, rir: np.ndarray) -> np.ndarray:
+    y = np.convolve(x, rir, mode="full")[: len(x)]
+    g = (rms(y) / (rms(x) + 1e-12)) if rms(x) > 0 else 1.0
+    return (y / (g + 1e-12)).astype(np.float32, copy=False)
 
-def apply_clipping(x, mode="hard", thr=0.95):
-    if mode == "hard": return np.clip(x, -thr, thr)
-    return np.tanh(x / thr)
+def apply_clipping(x: np.ndarray, mode: str = "hard", thr: float = 0.95) -> np.ndarray:
+    if mode == "hard":
+        return np.clip(x, -thr, thr).astype(np.float32, copy=False)
+    return np.tanh(x / thr).astype(np.float32, copy=False)
 
-def apply_opus_codec(x, sr, kbps=16):
+def _run_ffmpeg(cmd: list[str]):
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg failed: {' '.join(cmd)} :: {e}")
+
+def apply_opus_codec(x: np.ndarray, sr: int, kbps: int = 16) -> np.ndarray:
     """
-    Encodeaza prin libopus intr-un container .opus (Ogg) si decodeaza inapoi in WAV,
-    pentru a simula degradarea de codec. Evita scrierea libopus catre .wav.
+    Encodează prin libopus într-un container .opus (Ogg) și decodează înapoi în WAV,
+    pentru a simula degradarea de codec.
     """
     with tempfile.TemporaryDirectory() as td:
         tid = uuid.uuid4().hex
@@ -49,36 +66,30 @@ def apply_opus_codec(x, sr, kbps=16):
         sf.write(tmp_in_wav, x, sr)
 
         # encode → .opus (Ogg/Opus)
-        try:
-            subprocess.run(
-                ["ffmpeg","-y","-loglevel","error",
-                 "-i", tmp_in_wav,
-                 "-c:a","libopus","-b:a", f"{kbps}k",
-                 tmp_opus],
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"ffmpeg opus encode failed (is libopus available?): {e}")
+        _run_ffmpeg([
+            "ffmpeg","-y","-loglevel","error",
+            "-i", tmp_in_wav,
+            "-c:a","libopus","-b:a", f"{kbps}k",
+            tmp_opus
+        ])
 
         # decode → WAV (pcm_s16le, 1ch, sr)
-        try:
-            subprocess.run(
-                ["ffmpeg","-y","-loglevel","error",
-                 "-i", tmp_opus,
-                 "-c:a","pcm_s16le","-ar", str(sr), "-ac","1",
-                 tmp_out_wav],
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"ffmpeg decode back to wav failed: {e}")
+        _run_ffmpeg([
+            "ffmpeg","-y","-loglevel","error",
+            "-i", tmp_opus,
+            "-c:a","pcm_s16le","-ar", str(sr), "-ac","1",
+            tmp_out_wav
+        ])
 
         y, s = sf.read(tmp_out_wav, dtype="float32", always_2d=False)
         if s != sr:
             import resampy
             y = resampy.resample(y, s, sr)
-        if y.ndim > 1: y = y.mean(-1)
-        return y
+        if y.ndim > 1:
+            y = y.mean(-1)
+        return y.astype(np.float32, copy=False)
 
+# ---------------- Data ----------------
 @dataclass
 class MixMeta:
     id: str
@@ -97,33 +108,52 @@ class MixMeta:
     peak_before: float
     peak_after: float
 
-def mix_one(clean, noise, sr, snr_db, rir_path=None, codec=None, codec_kbps=None, clip_mode=None, target_len=None, seed=0):
+# ---------------- Core ----------------
+def mix_one(
+    clean: str | Path,
+    noise: str | Path,
+    sr: int,
+    snr_db: float,
+    rir_path: str | Path | None = None,
+    codec: str | None = None,
+    codec_kbps: int | None = None,
+    clip_mode: str | None = None,
+    target_len: int | None = None,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray, MixMeta]:
+
     rng = random.Random(seed)
     c = load_wav(clean, sr)
     n = load_wav(noise, sr)
 
     if target_len is None:
-        target_len = rng.randint(int(2*sr), int(8*sr))
-    if len(c) < target_len: c = norm_len(c, target_len)
-    if len(n) < target_len: n = np.pad(n, (0, target_len-len(n)))
+        target_len = rng.randint(int(2 * sr), int(8 * sr))
+
+    if len(c) < target_len:
+        c = norm_len(c, target_len)
+    if len(n) < target_len:
+        n = np.pad(n, (0, target_len - len(n)))
+
     off_c = 0
-    off_n = rng.randint(0, max(0, len(n)-target_len))
-    c = c[off_c:off_c+target_len]
-    n = n[off_n:off_n+target_len]
+    off_n = rng.randint(0, max(0, len(n) - target_len))
+    c = c[off_c: off_c + target_len]
+    n = n[off_n: off_n + target_len]
 
     if rir_path:
         rir = load_wav(rir_path, sr)
         c = convolve_rir(c, rir)
 
-    c_rms = rms(c); n_rms = rms(n)
+    c_rms = rms(c)
+    n_rms = rms(n)
     if n_rms < 1e-8:
-        n = np.random.randn(*n.shape).astype(np.float32) * 1e-6
+        n = (np.random.randn(*n.shape).astype(np.float32) * 1e-6)
         n_rms = rms(n)
-    target_noise_rms = c_rms / (10**(snr_db/20.0))
+
+    target_noise_rms = c_rms / (10 ** (snr_db / 20.0))
     noise_gain = target_noise_rms / (n_rms + 1e-12)
     y = c + n * noise_gain
 
-    if codec in ("opus_16","opus_24"):
+    if codec in ("opus_16", "opus_24"):
         kbps = 16 if codec == "opus_16" else 24
         y = apply_opus_codec(y, sr, kbps)
         y = norm_len(y, target_len)
@@ -135,17 +165,24 @@ def mix_one(clean, noise, sr, snr_db, rir_path=None, codec=None, codec_kbps=None
 
     meta = MixMeta(
         id=uuid.uuid4().hex,
-        clean_path=str(clean), noise_path=str(noise),
+        clean_path=str(clean),
+        noise_path=str(noise),
         rir_path=str(rir_path) if rir_path else None,
-        snr_db=float(snr_db), sr=sr,
-        codec=codec, codec_kbps={"opus_16":16,"opus_24":24}.get(codec),
-        clipping=clip_mode, target_len=int(target_len),
-        offset_clean=int(off_c), offset_noise=int(off_n),
-        gain_noise_db=20*math.log10(noise_gain+1e-12),
-        peak_before=peak_before, peak_after=peak_after
+        snr_db=float(snr_db),
+        sr=sr,
+        codec=codec,
+        codec_kbps={"opus_16": 16, "opus_24": 24}.get(codec),
+        clipping=clip_mode,
+        target_len=int(target_len),
+        offset_clean=int(off_c),
+        offset_noise=int(off_n),
+        gain_noise_db=float(20 * math.log10(noise_gain + 1e-12)),
+        peak_before=peak_before,
+        peak_after=peak_after,
     )
-    return y.astype(np.float32), c.astype(np.float32), meta
+    return y.astype(np.float32, copy=False), c.astype(np.float32, copy=False), meta
 
+# ---------------- I/O helpers ----------------
 def verify_out_dir(out_dir: Path, sr_expected: int) -> tuple[bool, str]:
     man_path = out_dir / "manifests" / "pairs.csv"
     if not man_path.exists():
@@ -153,11 +190,13 @@ def verify_out_dir(out_dir: Path, sr_expected: int) -> tuple[bool, str]:
     total = 0
     with open(man_path, newline="") as f:
         rdr = csv.DictReader(f)
+        if not rdr.fieldnames or not set(("noisy", "clean")).issubset(rdr.fieldnames):
+            return False, "invalid manifest header"
         for row in rdr:
             total += 1
             noisy = row["noisy"].strip()
             clean = row["clean"].strip()
-            meta  = row["meta"].strip() if "meta" in row else ""
+            meta  = row.get("meta", "").strip()
             for p in (noisy, clean):
                 if not Path(p).exists():
                     return False, f"missing file: {p}"
@@ -180,37 +219,49 @@ def append_row(path: Path, noisy: Path, clean: Path, meta: Path | str):
             f.write("noisy,clean,meta\n")
         f.write(f"{noisy},{clean},{meta}\n")
 
+# ---------------- CLI ----------------
+def _read_list(path: str | None) -> list[str]:
+    if not path:
+        return []
+    with open(path, "r") as f:
+        return [ln.strip() for ln in f if ln.strip()]
+
 def main():
     ap = argparse.ArgumentParser("mixgen")
-    ap.add_argument("--clean-list", required=True)
-    ap.add_argument("--noise-list", required=True)
-    ap.add_argument("--rir-list", default=None)
-    ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--snr", nargs="+", type=float, required=True)
+    ap.add_argument("--clean-list", required=True, help="fișier text cu căi către .wav/ .flac curate (una pe linie)")
+    ap.add_argument("--noise-list", required=True, help="fișier text cu căi către .wav de zgomot (una pe linie)")
+    ap.add_argument("--rir-list", default=None, help="opțional: fișier text cu căi către RIR-uri (una pe linie)")
+    ap.add_argument("--out-dir", required=True, help="directorul ieșire (va conține wav/, metadata/, manifests/)")
+    ap.add_argument("--snr", nargs="+", type=float, required=True, help="liste SNR dB (ex: --snr 0 5 10)")
     ap.add_argument("--sr", type=int, default=16000)
     ap.add_argument("--n-mixes", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--reverb-prob", type=float, default=0.0)
-    ap.add_argument("--codec", choices=["none","opus_16","opus_24"], default="none")
-    ap.add_argument("--clipping", choices=["none","hard","soft"], default="none")
+    ap.add_argument("--codec", choices=["none", "opus_16", "opus_24"], default="none")
+    ap.add_argument("--clipping", choices=["none", "hard", "soft"], default="none")
     ap.add_argument("--segment-min", type=float, default=2.0)
     ap.add_argument("--segment-max", type=float, default=8.0)
-    ap.add_argument("--verify-only", action="store_true")
-    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--verify-only", action="store_true", help="doar verifică out-dir și iese cu cod 0/1")
+    ap.add_argument("--force", action="store_true", help="ignoră manifestul existent și regenerează")
     args = ap.parse_args()
+
+    if args.segment_min <= 0 or args.segment_max <= 0 or args.segment_max < args.segment_min:
+        print("[mixgen] invalid segment range", file=sys.stderr)
+        raise SystemExit(2)
 
     set_seed(args.seed)
     out_dir = Path(args.out_dir)
-    (out_dir/"wav").mkdir(parents=True, exist_ok=True)
-    (out_dir/"metadata").mkdir(parents=True, exist_ok=True)
-    (out_dir/"manifests").mkdir(parents=True, exist_ok=True)
-    man_path = out_dir/"manifests"/"pairs.csv"
+    (out_dir / "wav").mkdir(parents=True, exist_ok=True)
+    (out_dir / "metadata").mkdir(parents=True, exist_ok=True)
+    (out_dir / "manifests").mkdir(parents=True, exist_ok=True)
+    man_path = out_dir / "manifests" / "pairs.csv"
 
     if args.verify_only:
         ok, msg = verify_out_dir(out_dir, args.sr)
         print(f"[mixgen][verify] {msg}")
         raise SystemExit(0 if ok else 1)
 
+    # Dacă avem deja manifest valid și nu e --force, nu mai facem nimic
     if man_path.exists() and not args.force:
         ok, msg = verify_out_dir(out_dir, args.sr)
         if ok:
@@ -219,20 +270,23 @@ def main():
         else:
             print(f"[mixgen] manifest exists but invalid → {msg} — will (re)generate.")
 
-    cleans = [l.strip() for l in open(args.clean_list) if l.strip()]
-    noises = [l.strip() for l in open(args.noise_list) if l.strip()]
-    rirs   = [l.strip() for l in open(args.rir_list)] if args.rir_list else []
+    cleans = _read_list(args.clean_list)
+    noises = _read_list(args.noise_list)
+    rirs   = _read_list(args.rir_list)
     if not cleans or not noises:
-        raise SystemExit("Empty clean/noise lists.")
+        print("[mixgen] Empty clean/noise lists.", file=sys.stderr)
+        raise SystemExit(2)
 
-    existing_ids = set()
-    if man_path.exists():
+    # Pentru idempotentă: colectăm ID-urile existente din manifest (dacă e prezent)
+    existing_ids: set[str] = set()
+    if man_path.exists() and not args.force:
         with open(man_path, newline="") as f:
             rdr = csv.DictReader(f)
-            for row in rdr:
-                noisy = Path(row["noisy"].strip()).name
-                stem  = noisy.replace("_noisy.wav","")
-                existing_ids.add(stem)
+            if rdr.fieldnames and "noisy" in rdr.fieldnames:
+                for row in rdr:
+                    noisy_name = Path(row["noisy"].strip()).name
+                    stem = noisy_name.replace("_noisy.wav", "")
+                    existing_ids.add(stem)
 
     wrote = 0
     for i in range(args.n_mixes):
@@ -242,27 +296,32 @@ def main():
         snr_db = random.choice(args.snr)
         seg_len = int(random.uniform(args.segment_min, args.segment_max) * args.sr)
 
-        # id determinist (permite skip)
-        uid = uuid.uuid5(uuid.NAMESPACE_DNS, f"{args.seed}-{i}-{clean}-{noise}-{snr_db}-{seg_len}-{rir_p}-{args.codec}-{args.clipping}").hex
+        # ID determinist (permite skip pe rerun)
+        uid = uuid.uuid5(
+            uuid.NAMESPACE_DNS,
+            f"{args.seed}-{i}-{clean}-{noise}-{snr_db}-{seg_len}-{rir_p}-{args.codec}-{args.clipping}"
+        ).hex
         if uid in existing_ids:
             continue
 
         y, c, m = mix_one(
             clean, noise, args.sr, snr_db, rir_p,
-            codec=None if args.codec=="none" else args.codec,
-            clip_mode=None if args.clipping=="none" else args.clipping,
-            target_len=seg_len, seed=args.seed+i
+            codec=None if args.codec == "none" else args.codec,
+            clip_mode=None if args.clipping == "none" else args.clipping,
+            target_len=seg_len, seed=args.seed + i
         )
         m.id = uid
 
-        noisy_path = out_dir/"wav"/f"{m.id}_noisy.wav"
-        clean_path = out_dir/"wav"/f"{m.id}_clean.wav"
-        meta_path  = out_dir/"metadata"/f"{m.id}.json"
+        noisy_path = out_dir / "wav" / f"{m.id}_noisy.wav"
+        clean_path = out_dir / "wav" / f"{m.id}_clean.wav"
+        meta_path  = out_dir / "metadata" / f"{m.id}.json"
 
+        # Nu rescriem dacă fișierele există deja (de ex. rulari întrerupte)
         if not (noisy_path.exists() and clean_path.exists() and meta_path.exists()):
             sf.write(noisy_path, y, args.sr)
             sf.write(clean_path, c, args.sr)
-            with open(meta_path,"w") as f: json.dump(asdict(m), f, indent=2)
+            with open(meta_path, "w") as f:
+                json.dump(asdict(m), f, indent=2)
 
         append_row(man_path, noisy_path, clean_path, meta_path)
         wrote += 1
