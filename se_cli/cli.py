@@ -1,3 +1,4 @@
+# se_cli/cli.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -22,7 +23,6 @@ from se_cli.config import load_config
 SUBCMDS = {"train", "eval", "enhance", "score", "export"}
 
 
-# --------- Runners resolver ---------
 def _get_runner(cmd: str):
     if cmd == "train":
         from runners import train as r
@@ -42,7 +42,6 @@ def _get_runner(cmd: str):
     raise SystemExit(f"Comandă necunoscută: {cmd}")
 
 
-# --------- Overrides parsing ---------
 def _flatten_overrides(raw: List[List[str]] | None) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for group in (raw or []):
@@ -89,24 +88,21 @@ def _apply_model_module_env(cfg: Dict[str, Any]) -> None:
 
 
 def _runner_accepts_cfg(run) -> bool:
-    """True dacă runner.main are exact 1 parametru pozițional (sau keyword) fără default."""
     try:
         sig = inspect.signature(run)
     except (TypeError, ValueError):
         return False
     params = [p for p in sig.parameters.values()
               if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
-    # acceptăm fie exact 1 param obligatoriu, fie 1 param cu default (tot e ok să-i dăm cfg)
     return len(params) >= 1
 
 
-# --------- CLI entry ---------
 def main(argv: List[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv:
+    if not argv or argv[0] in {"-h", "--help"}:
         print(f"Usage: python -m se_cli.cli <cmd> --config <file.yaml> [-o key.path=VALUE ...]")
         print(f"Comenzi: {', '.join(sorted(SUBCMDS))}")
-        return 1
+        return 0 if argv else 1
 
     cmd, rest = argv[0], argv[1:]
     if cmd not in SUBCMDS:
@@ -129,7 +125,7 @@ def main(argv: List[str] | None = None) -> int:
     try:
         overrides_raw = _flatten_overrides(gargs.override)
         cfg = load_config(gargs.config, overrides_raw)
-        _apply_overrides(cfg, overrides_raw)  # idempotent dacă loaderul le-a aplicat deja
+        _apply_overrides(cfg, overrides_raw)
         _apply_model_module_env(cfg)
     except Exception as exc:
         print(f"[cli] Eroare la încărcarea configului: {exc}", file=sys.stderr)
@@ -137,7 +133,6 @@ def main(argv: List[str] | None = None) -> int:
 
     run = _get_runner(cmd)
 
-    # Decizie pe baza semnăturii, NU pe baza excepțiilor din execuție.
     if _runner_accepts_cfg(run):
         try:
             ret = run(cfg)
@@ -145,11 +140,9 @@ def main(argv: List[str] | None = None) -> int:
         except SystemExit as e:
             return e.code if isinstance(e.code, int) else 0
         except Exception as exc:
-            # Eroare reală a runner-ului care primește cfg; nu încercăm să-l apelăm fără cfg.
             print(f"[cli] Runner '{cmd}' a eșuat: {exc}", file=sys.stderr)
             return 1
     else:
-        # Legacy path: expune cfg prin env și apelează fără argumente
         os.environ["SE_CONFIG_PATH"] = gargs.config
         os.environ["SE_CONFIG_OVERRIDES_JSON"] = json.dumps(overrides_raw)
         try:

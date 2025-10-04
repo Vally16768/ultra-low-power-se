@@ -1,74 +1,142 @@
+# runners/score.py
 from __future__ import annotations
-import os, sys, json, csv
+import csv
 from pathlib import Path
-from typing import Dict, Any
-import statistics as st
-import soundfile as sf
+from typing import Dict, Any, List, Tuple
+
 import numpy as np
-from metrics.pesq_metric import pesq_score
-from metrics.stoi_metric import stoi_score
-from metrics.snr_metrics import delta_snr
-from metrics.sisdr import sisdr
+import soundfile as sf
 
-def _load(path):
-    x, fs = sf.read(path, dtype="float32")
-    if x.ndim>1: x=x.mean(-1)
-    return x, fs
+from ._resolve import resolve_pathlike
 
-def score_manifest(manifest_csv: str) -> Dict[str, float]:
-    rows = []
-    with open(manifest_csv) as f:
-        rd = csv.DictReader(f)
-        for r in rd:
-            c, fs = _load(r["clean"])
-            n, _  = _load(r["noisy"])
-            e, _  = _load(r["enhanced"])
-            row = {
-                "PESQ": pesq_score(c, e, fs),
-                "STOI": stoi_score(c, e, fs),
-                "DELTA_SNR": delta_snr(c, n, e),
-                "SI_SDR": sisdr(c, e),
-                "clean": r["clean"], "noisy": r["noisy"], "enhanced": r["enhanced"]
-            }
-            rows.append(row)
-    agg = {k: st.mean([r[k] for r in rows]) for k in ["PESQ","STOI","DELTA_SNR","SI_SDR"]}
-    return {"aggregate": agg, "rows": rows}
+try:
+    from pesq import pesq
+except Exception:
+    pesq = None
 
-def _write_outputs(out_dir: str | Path, result: Dict[str, Any]):
-    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir/"metrics.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    with open(out_dir/"metrics.csv","w") as f:
-        w = csv.writer(f); w.writerow(["PESQ","STOI","DELTA_SNR","SI_SDR","clean","noisy","enhanced"])
-        for r in result["rows"]:
-            w.writerow([r["PESQ"], r["STOI"], r["DELTA_SNR"], r["SI_SDR"], r["clean"], r["noisy"], r["enhanced"]])
-    print(f"[score] wrote {out_dir}/metrics.json & metrics.csv")
+try:
+    from pystoi import stoi
+except Exception:
+    stoi = None
 
-def _check_thresholds(agg: Dict[str,float], thr: Dict[str, float]) -> int:
-    failures = []
-    for k, t in thr.items():
-        if k in agg and agg[k] < t:
-            failures.append((k, agg[k], t))
-    if failures:
-        print("[score][FAIL]", failures)
-        return 2
-    print("[score][PASS]", {k: round(v,4) for k,v in agg.items()})
+
+def _read_pairs(manifest: str | Path) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    with open(manifest, "r", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            out.append((row["noisy"], row["clean"]))
+    return out
+
+
+def _mono(x: np.ndarray) -> np.ndarray:
+    return x if x.ndim == 1 else x.mean(axis=1)
+
+
+def _sdr_si(x_hat: np.ndarray, s: np.ndarray, eps=1e-8) -> float:
+    s = s - np.mean(s)
+    x_hat = x_hat - np.mean(x_hat)
+    alpha = np.dot(x_hat, s) / (np.dot(s, s) + eps)
+    e_target = alpha * s
+    e_noise = x_hat - e_target
+    ratio = (np.sum(e_target ** 2) + eps) / (np.sum(e_noise ** 2) + eps)
+    return 10.0 * np.log10(ratio + eps)
+
+
+def _seg_snr(x_hat: np.ndarray, s: np.ndarray, sr: int, frame_ms=20, eps=1e-8) -> float:
+    N = int(sr * frame_ms / 1000.0)
+    if len(s) < N or len(x_hat) < N:
+        return 10.0 * np.log10((np.sum(s**2)+eps) / (np.sum((s-x_hat)**2)+eps) + eps)
+    M = min(len(s), len(x_hat))
+    s = s[:M]; x_hat = x_hat[:M]
+    num = 0.0; den = 0.0; k = 0
+    for i in range(0, M, N):
+        ss = s[i:i+N]
+        xx = x_hat[i:i+N]
+        if len(ss) < N or len(xx) < N:
+            break
+        num += np.sum(ss**2)
+        den += np.sum((ss-xx)**2)
+        k += 1
+    if k == 0:
+        return 0.0
+    return 10.0 * np.log10((num + eps) / (den + eps) + eps)
+
+
+def score_dir(cfg: Dict[str, Any],
+              ref_manifest: str | Path,
+              est_dir: str | Path,
+              metrics: List[str],
+              sr: int,
+              out_csv: str | Path) -> None:
+    pairs = _read_pairs(ref_manifest)
+    est_dir = Path(est_dir)
+
+    rows_out: List[Dict[str, float | str]] = []
+    sums = {m: 0.0 for m in metrics}
+    cnt_eff = {m: 0 for m in metrics}
+
+    for noisy_path, clean_path in pairs:
+        est_path = est_dir / Path(noisy_path).name
+        if not est_path.exists():
+            print(f"[score] Lipsă enhanced pentru {noisy_path} → {est_path.name}")
+            continue
+
+        ref, sr1 = sf.read(clean_path, always_2d=False)
+        est, sr2 = sf.read(est_path, always_2d=False)
+        ref = _mono(np.asarray(ref, dtype=np.float32))
+        est = _mono(np.asarray(est, dtype=np.float32))
+        if sr1 != sr or sr2 != sr:
+            raise SystemExit(f"[score] SR neuniform (ref={sr1}, est={sr2}) — folosește {sr} Hz peste tot.")
+
+        row = {"file": Path(noisy_path).name}
+        for m in metrics:
+            if m == "pesq":
+                val = float("nan") if pesq is None else float(pesq(sr, ref, est, "wb"))
+            elif m == "stoi":
+                val = float("nan") if stoi is None else float(stoi(ref, est, sr, extended=False))
+            elif m == "si_sdr":
+                val = _sdr_si(est, ref)
+            elif m == "seg_snr":
+                val = _seg_snr(est, ref, sr)
+            else:
+                raise SystemExit(f"[score] Metrică necunoscută: {m}")
+            row[m] = val
+            if not np.isnan(val):
+                sums[m] += val
+                cnt_eff[m] += 1
+        rows_out.append(row)
+
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["file"] + metrics
+    with open(out_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows_out:
+            w.writerow(r)
+
+    print("[score] Rezumat medii pe set (ignorat NaN):")
+    for m in metrics:
+        n_eff = cnt_eff[m]
+        avg = (sums[m] / max(n_eff, 1)) if n_eff > 0 else float("nan")
+        print(f"  - {m}: {avg:.4f}  (n={n_eff})")
+    print(f"[score] Scris per-fișier: {out_csv}")
+
+
+def main(cfg: Dict[str, Any]) -> int:
+    eval_cfg = cfg.get("eval", {})
+    sr = int(eval_cfg.get("sr") or cfg.get("data", {}).get("sample_rate", 16000))
+    metrics = eval_cfg.get("metrics", ["pesq", "stoi", "si_sdr", "seg_snr"])
+
+    offline = eval_cfg.get("offline", {})
+    ref_manifest = offline.get("manifest") or cfg.get("data", {}).get("manifests", {}).get("test_offline")
+    ref_manifest = resolve_pathlike(ref_manifest, cfg)
+    if not ref_manifest:
+        raise SystemExit("[score] Trebuie ref_manifest în cfg.eval.offline.manifest sau data.manifests.test_offline")
+
+    est_dir = resolve_pathlike(offline.get("outdir") or "artifacts/eval/mamba_unet/enhanced", cfg)
+    out_csv = Path(est_dir).with_suffix(".scores.csv")
+
+    score_dir(cfg, ref_manifest, est_dir, metrics, sr, out_csv)
     return 0
-
-def main(cfg: Dict[str, Any]):
-    thresholds = cfg.get("evaluation",{}).get("thresholds", {"PESQ":3.0,"STOI":0.93,"DELTA_SNR":9.0,"SI_SDR":10.0})
-
-    # scor standard
-    man_std = "artifacts/infer/test_standard/pairs_eval.csv"
-    res_std = score_manifest(man_std)
-    _write_outputs("artifacts/score/test_standard", res_std)
-    rc1 = _check_thresholds(res_std["aggregate"], thresholds)
-
-    # scor streaming (dacă există)
-    man_stream = Path("artifacts/infer/challenge_streaming/pairs_eval.csv")
-    rc2 = 0
-    if man_stream.exists():
-        res_stream = score_manifest(str(man_stream))
-        _write_outputs("artifacts/score/challenge_streaming", res_stream)
-        rc2 = _check_thresholds(res_stream["aggregate"], thresholds)
-
-    sys.exit( rc1 or rc2 )

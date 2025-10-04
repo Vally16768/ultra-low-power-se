@@ -59,6 +59,7 @@ reports/
 logs/
 wandb/
 runs/
+enhanced/
 
 # OS / Editor
 .DS_Store
