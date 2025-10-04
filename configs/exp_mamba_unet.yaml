@@ -1,83 +1,74 @@
-experiment:
-  name: mamba_unet_v0
-  out_dir: artifacts/exp
+# -----------------------------
+# Ultra-Low-Power SE — Config exemplu mamba_unet
+# -----------------------------
 
-# ==== MODEL (o singură secțiune curată) ====
-model:
-  module: se_models.mamba_unet.model          # doar modulul; build_model e căutat în el
-  name: mamba_unet
-  in_ch: 1
-  base_channels: 32
-  depth: 3
-  causal: true
-  # opțional, pentru warm-start/export; dacă vrei resume de la last, setează train.resume
-  checkpoint: artifacts/exp/mamba_unet_v0/checkpoints/best.ckpt
+project:
+  name: ultra-low-power-se
+  seed: 1234
 
-# ==== DATE ====
 data:
   sample_rate: 16000
-  train_manifest: data/prepared/mix/train/manifests/pairs.csv
-  val_manifest:   data/prepared/mix/val/manifests/pairs.csv
-  manifests:
-    test_offline:  data/prepared/voicebank/test/manifests/pairs.csv
-    test_streaming: data/prepared/test_challenge/streaming/manifests/pairs.csv
+  # Seturi folosite la train/val — păstrate aici ca referință.
+  voicebank:
+    root: data/voicebank-demand-16k
+    train_manifest: data/prepared/voicebank/train/manifests/pairs.csv
+    val_manifest:   data/prepared/voicebank/val/manifests/pairs.csv
+    test_manifest:  data/prepared/voicebank/test/manifests/pairs.csv
 
-# ==== ANTRENARE ====
+model:
+  # Factory care construiește modelul (returnează nn.Module)
+  # Acceptă "modul:funcție" sau "modul" (caută build_model).
+  module: se_models.mamba_unet.model:build_model
+
+  # Exemplu de hiperparametri (trebuie să se potrivească EXACT cu ce ai folosit la antrenare)
+  params:
+    in_channels: 1
+    out_channels: 1
+    base_channels: 48          # asigură-te că dă ~1.81M param. ca în log
+    depth: 4
+    kernel_size: 15
+    stride: 2
+    # Adaugă aici orice alt parametru specific modelului tău
+
 train:
-  epochs: 50
-  batch_size: 8
-  lr: 2.0e-4
-  segment_sec: 4.0
-  seed: 1337
-  num_workers: 4
-
-  amp: true
-  grad_clip: 5.0
-  grad_accum_steps: 1   # crește >1 pentru batch efectiv mai mare
-
-  w_time: 0.2
-  w_mag:  0.6
-  w_sc:   0.2
-  w_sisdr: 1.0
-
+  optimizer:
+    name: adamw
+    lr: 0.001
+    weight_decay: 0.0
   scheduler:
+    name: ReduceLROnPlateau
     mode: min
     factor: 0.5
     patience: 5
     min_lr: 1.0e-6
-    cooldown: 0
-    threshold: 1.0e-4
-    threshold_mode: rel
-    eps: 1.0e-8
+    # 'verbose' nu e suportat de wrapperul tău, așa că nu-l punem.
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  epochs: 100
+  outdir: artifacts/exp/mamba_unet_v0
+  tb_dir: artifacts/exp/mamba_unet_v0/tb
 
-  early_stopping:
-    patience: 10
-    min_delta: 0.0
+loss:
+  # exemplu — ajustează după implementarea ta
+  l1_time: 1.0
+  mrstft_mag_l1: 0.5
+  mrstft_sc: 0.5
+  si_sdr: 0.2
 
-  # opțional:
-  # resume: artifacts/exp/mamba_unet_v0/last.ckpt
+export:
+  onnx:
+    out: artifacts/export/mamba_unet_auto.onnx
+    opset: 17
 
-# ==== EVALUARE ====
 eval:
-  sr: 16000
+  # Manifestul offline (cum apare în logurile tale)
+  manifest: data/prepared/voicebank/test/manifests/pairs.csv
+  outdir: artifacts/eval/mamba_unet/enhanced
   metrics: [pesq, stoi, si_sdr, seg_snr]
-  offline:
-    manifest: data/prepared/voicebank/test/manifests/pairs.csv
-    outdir: artifacts/eval/mamba_unet/enhanced
   streaming:
     enabled: false
-    manifest: data/prepared/test_challenge/streaming/manifests/pairs.csv
-    window: 20480        # 1.28s la 16k
-    hop:    10240        # 50% overlap
 
-# ==== INFERENȚĂ DEMO ====
 inference:
-  out_wav: artifacts/demo_out.wav
-  seconds: 1
-
-# ==== EXPORT ONNX ====
-export:
-  sample_len: 16000
-  opset: 17
-  dynamic_axes: true
-  quantize_dynamic: false
+  # IMPORTANT: setat explicit, ca să nu mai “autodiscover” un ckpt nepotrivit
+  checkpoint: artifacts/exp/mamba_unet_v0/best.ckpt
