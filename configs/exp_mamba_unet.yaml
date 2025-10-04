@@ -3,6 +3,12 @@ experiment:
   name: mamba_unet_v0
   out_dir: artifacts/exp
 
+model:
+  base_channels: 32
+  depth: 3
+export:
+  sample_len: 16000
+
 data:
   sample_rate: 16000
   train_manifest: data/prepared/mix/train/manifests/pairs.csv
