@@ -1,13 +1,19 @@
-# configs/exp_mamba_unet.yaml
 experiment:
   name: mamba_unet_v0
   out_dir: artifacts/exp
 
+# ==== MODEL (o singură secțiune curată) ====
 model:
+  module: se_models.mamba_unet.model          # doar modulul; build_model e căutat în el
+  name: mamba_unet
+  in_ch: 1
   base_channels: 32
   depth: 3
-  causal: true     # pentru streaming/edge
+  causal: true
+  # opțional, pentru warm-start/export; dacă vrei resume de la last, setează train.resume
+  checkpoint: artifacts/exp/mamba_unet_v0/checkpoints/best.ckpt
 
+# ==== DATE ====
 data:
   sample_rate: 16000
   train_manifest: data/prepared/mix/train/manifests/pairs.csv
@@ -16,13 +22,7 @@ data:
     test_offline:  data/prepared/voicebank/test/manifests/pairs.csv
     test_streaming: data/prepared/test_challenge/streaming/manifests/pairs.csv
 
-model:
-  module: se_models.mamba_unet.model:build_model
-  name: mamba_unet
-  in_ch: 1
-  base: 32
-  checkpoint: artifacts/exp/mamba_unet_v0/checkpoints/best.ckpt  
-
+# ==== ANTRENARE ====
 train:
   epochs: 50
   batch_size: 8
@@ -33,6 +33,7 @@ train:
 
   amp: true
   grad_clip: 5.0
+  grad_accum_steps: 1   # crește >1 pentru batch efectiv mai mare
 
   w_time: 0.2
   w_mag:  0.6
@@ -45,21 +46,38 @@ train:
     patience: 5
     min_lr: 1.0e-6
     cooldown: 0
+    threshold: 1.0e-4
+    threshold_mode: rel
+    eps: 1.0e-8
 
   early_stopping:
     patience: 10
     min_delta: 0.0
 
+  # opțional:
+  # resume: artifacts/exp/mamba_unet_v0/last.ckpt
+
+# ==== EVALUARE ====
 eval:
   sr: 16000
   metrics: [pesq, stoi, si_sdr, seg_snr]
   offline:
-    manifest: ${data.manifests.test_offline}
+    manifest: data/prepared/voicebank/test/manifests/pairs.csv
     outdir: artifacts/eval/mamba_unet/enhanced
   streaming:
     enabled: false
-    manifest: ${data.manifests.test_streaming}
+    manifest: data/prepared/test_challenge/streaming/manifests/pairs.csv
+    window: 20480        # 1.28s la 16k
+    hop:    10240        # 50% overlap
 
+# ==== INFERENȚĂ DEMO ====
 inference:
   out_wav: artifacts/demo_out.wav
   seconds: 1
+
+# ==== EXPORT ONNX ====
+export:
+  sample_len: 16000
+  opset: 17
+  dynamic_axes: true
+  quantize_dynamic: false

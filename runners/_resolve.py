@@ -5,6 +5,7 @@ import os, re
 
 _DOLLAR = re.compile(r"^\$\{([^}]+)\}$")
 
+
 def _get_by_path(cfg: Dict[str, Any], dotted: str) -> Any:
     cur: Any = cfg
     for p in dotted.split("."):
@@ -12,6 +13,7 @@ def _get_by_path(cfg: Dict[str, Any], dotted: str) -> Any:
             return None
         cur = cur[p]
     return cur
+
 
 def resolve_pathlike(val: Any, cfg: Dict[str, Any]) -> str | None:
     """

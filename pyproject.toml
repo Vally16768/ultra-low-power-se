@@ -13,7 +13,7 @@ ignore = [
   "E401","E701","E702","E501",  # <-- ignoră line-length
   "F401",
   "I001",
-  "UP035","UP006","UP045","UP015",
+  "UP035","UP006","UP015",
   "B905","B007",               # <-- ignoră loop-var nefolosită
 ]
 

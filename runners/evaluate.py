@@ -18,19 +18,14 @@ def main(cfg: Dict[str, Any]) -> int:
 
     # ---- OFFLINE ----
     offline = eval_cfg.get("offline", {})
-    manifest_off = (
-        offline.get("manifest")
-        or cfg.get("data", {}).get("manifests", {}).get("test_offline")
-        or "data/prepared/voicebank/test/manifests/pairs.csv"
-    )
+    manifest_off = offline.get("manifest") or cfg.get("data", {}).get("manifests", {}).get("test_offline") or "data/prepared/voicebank/test/manifests/pairs.csv"
     manifest_off = resolve_pathlike(manifest_off, cfg)
     outdir_off = resolve_pathlike(offline.get("outdir") or "artifacts/eval/mamba_unet/enhanced", cfg)
     os.makedirs(outdir_off, exist_ok=True)
 
     if not _exists(manifest_off):
         raise SystemExit(
-            f"[eval:offline] Manifest lipsă: {manifest_off}\n"
-            f"→ Rulează `make datasets` sau setează cfg.eval.offline.manifest / data.manifests.test_offline."
+            f"[eval:offline] Manifest lipsă: {manifest_off}\n" f"→ Rulează `make datasets` sau setează cfg.eval.offline.manifest / data.manifests.test_offline."
         )
 
     print(f"[eval] Offline manifest: {manifest_off}")
@@ -39,10 +34,12 @@ def main(cfg: Dict[str, Any]) -> int:
 
     # 1) Enhance
     from runners.infer import enhance_dataset
+
     enhance_dataset(cfg, manifest_off, outdir_off, sr=sr)
 
     # 2) Score
     from runners.score import score_dir
+
     score_csv = Path(outdir_off).with_suffix(".scores.csv")
     score_dir(
         cfg=cfg,

@@ -33,27 +33,32 @@ def _resolve_builder(mod_path: str):
         return getattr(mod, fn)
     mod = importlib.import_module(mod_path)
     if hasattr(mod, "build_model"):
-        return getattr(mod, "build_model")
+        return mod.build_model
     if hasattr(mod, "Net"):
+
         def _wrap(cfg=None):
             try:
                 return mod.Net(cfg)
             except TypeError:
                 return mod.Net()
+
         return _wrap
     raise SystemExit(f"[infer] Nu găsesc builder în modulul: {mod_path}")
 
 
 def _strip_module(sd):
     from collections import OrderedDict
+
     out = OrderedDict()
     for k, v in sd.items():
         out[k[7:]] = v if k.startswith("module.") else v
     return out
 
+
 def _try_load_ckpt(model, ckpt_path: str):
     import torch
     from pathlib import Path
+
     p = Path(ckpt_path).expanduser()
     if not p.exists():
         print(f"[infer] WARNING: checkpoint inexistent: {p}")
@@ -62,7 +67,8 @@ def _try_load_ckpt(model, ckpt_path: str):
     sd = None
     for key in ("state_dict", "model", "net", "weights"):
         if isinstance(obj, dict) and key in obj and isinstance(obj[key], dict):
-            sd = obj[key]; break
+            sd = obj[key]
+            break
     if sd is None:
         sd = obj if isinstance(obj, dict) else None
     if not isinstance(sd, dict):
@@ -73,8 +79,10 @@ def _try_load_ckpt(model, ckpt_path: str):
     print(f"[infer] loaded checkpoint: {p.name}  (missing={len(missing)}, unexpected={len(unexpected)})")
     return True
 
+
 def _autodiscover_ckpt(cfg):
     from pathlib import Path
+
     exp = cfg.get("experiment", {})
     root = Path(exp.get("out_dir", "artifacts/exp")) / exp.get("name", "")
     cands = []
@@ -88,6 +96,7 @@ def _autodiscover_ckpt(cfg):
     cands = sorted(cands, key=lambda p: (("best" not in p.name.lower()), -p.stat().st_mtime))
     return str(cands[0])
 
+
 def _build_model(cfg: Dict[str, Any]) -> nn.Module:
     modpath = cfg.get("model", {}).get("module", "se_models.mamba_unet.model:build_model")
     builder = _resolve_builder(modpath)
@@ -100,6 +109,7 @@ def _build_model(cfg: Dict[str, Any]) -> nn.Module:
         p.requires_grad_(False)
 
     from pathlib import Path
+
     ckpt_cfg = cfg.get("model", {}).get("checkpoint")
     ckpt_eff = None
     if ckpt_cfg and Path(ckpt_cfg).expanduser().exists():
@@ -139,7 +149,7 @@ def enhance_dataset(cfg: Dict[str, Any], manifest: str | Path, outdir: str | Pat
 
         xt = torch.from_numpy(x).float().to(device).view(1, 1, -1)
         y = model(xt)
-        if isinstance(y, (tuple, list)):
+        if isinstance(y, tuple | list):
             y = y[0]
         y = y.squeeze().detach().cpu().numpy()
 
@@ -157,10 +167,7 @@ def main(cfg: Dict[str, Any]) -> int:
         or cfg.get("data", {}).get("manifests", {}).get("test_offline")
     )
     manifest_res = resolve_pathlike(manifest, cfg)
-    outdir = resolve_pathlike(
-        cfg.get("eval", {}).get("offline", {}).get("outdir") or "artifacts/eval/mamba_unet/enhanced",
-        cfg
-    )
+    outdir = resolve_pathlike(cfg.get("eval", {}).get("offline", {}).get("outdir") or "artifacts/eval/mamba_unet/enhanced", cfg)
     if manifest_res:
         enhance_dataset(cfg, manifest_res, outdir, sr=sr)
         return 0
@@ -184,7 +191,7 @@ def main(cfg: Dict[str, Any]) -> int:
 
     with torch.no_grad():
         y = model(xt)
-        if isinstance(y, (tuple, list)):
+        if isinstance(y, tuple | list):
             y = y[0]
         y = y.squeeze().detach().cpu().numpy()
 

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 import argparse, json, os, platform, subprocess
 
-ap=argparse.ArgumentParser()
+ap = argparse.ArgumentParser()
 ap.add_argument("--metrics", required=True)
 ap.add_argument("--timing", required=True)
 ap.add_argument("--out", required=True)
-args=ap.parse_args()
+args = ap.parse_args()
 
-m=json.load(open(args.metrics))
-t=json.load(open(args.timing))
+m = json.load(open(args.metrics))
+t = json.load(open(args.timing))
+
 
 def sh(cmd):
     try:
@@ -16,14 +17,15 @@ def sh(cmd):
     except Exception:
         return "n/a"
 
+
 pyver = platform.python_version()
 pip_freeze = sh("pip freeze | sed -n '1,100p'")
 
-md=f"""# Model Card
+md = f"""# Model Card
 
-**Exp:** `{m.get('exp_id')}`  
-**Commit:** `{m.get('commit')}`  
-**Dataset:** `{m.get('dataset')}`  
+**Exp:** `{m.get('exp_id')}`
+**Commit:** `{m.get('commit')}`
+**Dataset:** `{m.get('dataset')}`
 **FS:** {m.get('fs_hz')} Hz
 
 ## Objective metrics
@@ -46,5 +48,5 @@ md=f"""# Model Card
 - Metrics may vary ± small tolerances.
 """
 os.makedirs(os.path.dirname(args.out), exist_ok=True)
-open(args.out,"w").write(md)
+open(args.out, "w").write(md)
 print("[model_card] wrote", args.out)

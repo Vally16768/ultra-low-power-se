@@ -2,6 +2,7 @@ import numpy as np
 
 _EPS = 1e-12
 
+
 def _snr_db(clean: np.ndarray, test: np.ndarray) -> float:
     """
     SNR(clean, test) = 10*log10( sum(clean^2) / sum((clean - test)^2) )
@@ -14,6 +15,7 @@ def _snr_db(clean: np.ndarray, test: np.ndarray) -> float:
     den = np.sum(err * err) + _EPS
     return 10.0 * np.log10(nrg / den)
 
+
 def delta_snr(clean: np.ndarray, noisy: np.ndarray, enhanced: np.ndarray) -> float:
     """
     ΔSNR = SNR(clean, enhanced) - SNR(clean, noisy)
@@ -21,8 +23,10 @@ def delta_snr(clean: np.ndarray, noisy: np.ndarray, enhanced: np.ndarray) -> flo
     """
     return _snr_db(clean, enhanced) - _snr_db(clean, noisy)
 
+
 def snr_noisy(clean: np.ndarray, noisy: np.ndarray) -> float:
     return _snr_db(clean, noisy)
+
 
 def snr_enhanced(clean: np.ndarray, enhanced: np.ndarray) -> float:
     return _snr_db(clean, enhanced)

@@ -1,9 +1,11 @@
 import numpy as np
 
+
 def sisdr(s, s_hat, eps=1e-8):
     s = s.astype(np.float32).reshape(-1)
     s_hat = s_hat.astype(np.float32).reshape(-1)
-    s = s - np.mean(s); s_hat = s_hat - np.mean(s_hat)
+    s = s - np.mean(s)
+    s_hat = s_hat - np.mean(s_hat)
     alpha = (np.dot(s_hat, s) + eps) / (np.dot(s, s) + eps)
     s_target = alpha * s
     e_noise = s_hat - s_target
