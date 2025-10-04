@@ -1,10 +1,25 @@
-# Pin lightweight essentials; install PyTorch separately per platform
+# === Core numeric/audio ===
 numpy>=1.24
+scipy>=1.11
 soundfile>=0.12
 librosa>=0.10
+resampy>=0.4.3
+
+# === Config / tooling ===
 pyyaml>=6.0
+packaging>=23.1
+typing_extensions>=4.8
+
+# === ONNX / runtime & checks ===
 onnx>=1.16
 onnxruntime>=1.18
+
+# === Logging / TB / CLI niceties ===
+tensorboard>=2.12
+tqdm>=4.66
+
+# === QA / lint ===
 pytest>=8.0
 ruff>=0.6
 mypy>=1.8
+

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-
+# -*- coding: utf-8 -*-
 
 import argparse, importlib, json, os, sys
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import torch
+
 
 def load_symbol(path: str):
     if ":" not in path:
@@ -12,6 +13,7 @@ def load_symbol(path: str):
     mod, attr = path.split(":", 1)
     m = importlib.import_module(mod)
     return getattr(m, attr)
+
 
 def load_cfg(yaml_path: str | None) -> Dict[str, Any]:
     if not yaml_path:
@@ -24,7 +26,9 @@ def load_cfg(yaml_path: str | None) -> Dict[str, Any]:
     with open(yaml_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
+
 def build_model(symbol, cfg: Dict[str, Any]) -> torch.nn.Module:
+    # Încearcă builder(cfg) → builder() → .build_model(cfg) → .Net(cfg)
     if callable(symbol):
         try:
             return symbol(cfg)
@@ -42,13 +46,15 @@ def build_model(symbol, cfg: Dict[str, Any]) -> torch.nn.Module:
             return symbol.Net()
     raise RuntimeError("Simbolul dat nu e apelabil și nu are build_model/Net")
 
+
 def make_dummy(input_shape: str | None, sr: int, seconds: float, device: torch.device) -> torch.Tensor:
     if input_shape:
         dims = [int(x) for x in input_shape.strip().split(",")]
         return torch.randn(*dims, device=device, dtype=torch.float32)
-    base = 320 if sr == 16000 else max(1, sr // 50)  # ~20 ms
+    base = 320 if sr == 16000 else max(1, sr // 50)  # ~20 ms grid
     T = max(base, int(round(sr * seconds / base) * base))
     return torch.randn(1, 1, T, device=device, dtype=torch.float32)  # [B,1,T]
+
 
 def infer_outputs(model: torch.nn.Module, x: torch.Tensor) -> Tuple[List[str], List[torch.Tensor]]:
     model.eval()
@@ -66,17 +72,28 @@ def infer_outputs(model: torch.nn.Module, x: torch.Tensor) -> Tuple[List[str], L
         return names, ts
     raise RuntimeError("Modelul a returnat tip ne-suportat (aștept Tensor sau list/tuple de Tensor).")
 
-def export_classic(model, x, out_path: Path, opset: int, in_name: str, out_names: List[str], dynamic: bool) -> None:
+
+def export_classic(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    out_path: Path,
+    opset: int,
+    in_name: str,
+    out_names: List[str],
+    dynamic: bool,
+) -> None:
     dynamic_axes = None
     if dynamic:
         dynamic_axes = {in_name: {-1: "T"}}
         for n in out_names:
             dynamic_axes[n] = {-1: "T"}
     torch.onnx.export(
-        model, x, str(out_path),
+        model,
+        x,
+        str(out_path),
         export_params=True,
         opset_version=opset,
-        do_constant_folding=False,
+        do_constant_folding=True,  # stabilitate
         input_names=[in_name],
         output_names=out_names,
         dynamic_axes=dynamic_axes,
@@ -84,7 +101,8 @@ def export_classic(model, x, out_path: Path, opset: int, in_name: str, out_names
         keep_initializers_as_inputs=False,
     )
 
-def try_dynamo(model, x, out_path: Path, dynamic: bool) -> bool:
+
+def try_dynamo(model: torch.nn.Module, x: torch.Tensor, out_path: Path, dynamic: bool) -> bool:
     try:
         from torch.onnx import dynamo_export
     except Exception:
@@ -97,6 +115,7 @@ def try_dynamo(model, x, out_path: Path, dynamic: bool) -> bool:
     except Exception as e:
         print(f"[info] dynamo_export a eșuat: {e!r}")
         return False
+
 
 def main():
     ap = argparse.ArgumentParser(description="Export ONNX (automat, simplu).")
@@ -114,14 +133,19 @@ def main():
     ap.add_argument("--keep-ch", type=int, default=1, help="1 = forțează ieșire [B,1,T]")
     args = ap.parse_args()
 
+    # CPU-only export (determinism)
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
     device = torch.device("cpu")
+    torch.manual_seed(0)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+    # Load config + model
     cfg = load_cfg(args.config)
     sym = load_symbol(args.model)
     model = build_model(sym, cfg).to(device).eval()
 
-    # wrapper opțional pentru [B,1,T]
+    # Optional wrapper pentru [B,1,T] la ieșire
     if args.keep_ch:
         class KeepCh(torch.nn.Module):
             def __init__(self, net):
@@ -136,15 +160,21 @@ def main():
                 return y
         model = KeepCh(model).eval()
 
+    # Încarcă checkpoint, dacă e furnizat
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location="cpu")
         if isinstance(state, dict) and "state_dict" in state:
+            # normalizează cheile în caz de lightning-style
             state = {k.replace("model.", "", 1): v for k, v in state["state_dict"].items()}
         model.load_state_dict(state, strict=False)
 
+    # Dummy input
     x = make_dummy(args.input_shape, args.sr, args.seconds, device)
+
+    # Forțează un forward pentru a determina nume/output-uri
     out_names, _ = infer_outputs(model, x)
 
+    # Export
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -153,21 +183,25 @@ def main():
         if not ok:
             print("[info] continui cu exporterul clasic…")
             try:
-                export_classic(model, x, out_path, args.opset, args.input_name, out_names, dynamic=bool(args.dynamic))
+                with torch.no_grad():
+                    export_classic(model, x, out_path, args.opset, args.input_name, out_names, dynamic=bool(args.dynamic))
             except Exception as e_dyn:
                 print(f"[info] classic dinamic a eșuat ({e_dyn!r}); încerc STATIC…")
-                export_classic(model, x, out_path, args.opset, args.input_name, out_names, dynamic=False)
+                with torch.no_grad():
+                    export_classic(model, x, out_path, args.opset, args.input_name, out_names, dynamic=False)
     else:
         try:
-            export_classic(model, x, out_path, args.opset, args.input_name, out_names, dynamic=bool(args.dynamic))
+            with torch.no_grad():
+                export_classic(model, x, out_path, args.opset, args.input_name, out_names, dynamic=bool(args.dynamic))
         except Exception as e:
             if args.dynamic:
                 print(f"[info] classic dinamic a eșuat ({e!r}); încerc STATIC…")
-                export_classic(model, x, out_path, args.opset, args.input_name, out_names, dynamic=False)
+                with torch.no_grad():
+                    export_classic(model, x, out_path, args.opset, args.input_name, out_names, dynamic=False)
             else:
                 raise
 
-    # validare minimală ONNX
+    # Validare minimală ONNX
     try:
         import onnx
         onnx.checker.check_model(onnx.load(str(out_path)))
@@ -175,6 +209,7 @@ def main():
     except Exception as e:
         print(f"[warn] onnx.checker a raportat o problemă: {e!r}")
 
+    # Sidecar JSON cu metadate utile
     side = {
         "engine": "dynamo_export" if args.use_dynamo else "classic",
         "dynamic": bool(args.dynamic),
@@ -182,10 +217,11 @@ def main():
         "input_name": args.input_name,
         "output_names": out_names,
         "example_input_shape": list(x.shape),
-        "sr": int(cfg.get("data", {}).get("sample_rate", 16000)),
+        "sr": int(cfg.get("data", {}).get("sample_rate", args.sr)),
     }
     Path(str(out_path) + ".json").write_text(json.dumps(side, indent=2), encoding="utf-8")
     print(f"[done] saved: {out_path} (+ sidecar .json)")
+
 
 if __name__ == "__main__":
     main()

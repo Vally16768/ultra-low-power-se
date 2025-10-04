@@ -1,73 +1,89 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-: "${DEMAND_ROOT:=/data/DEMAND}"
-NOISE_DIR="data/noise"
-mkdir -p "$NOISE_DIR/demand" "$NOISE_DIR/synth" data/lists
+ROOT="data"
+DEMAND="$ROOT/noise/demand"
+CUSTOM="$ROOT/noise/custom"
+SYNTH="$ROOT/noise/synth"
+DEV_DIR="$ROOT/noise/dev"
+UNSEEN_DIR="$ROOT/noise/unseen"
+LISTS="$ROOT/lists"
+mkdir -p "$LISTS"
 
-# --- 1) DEMAND: facem lista completă (wav/flac), dacă există ---
-if [[ -d "$DEMAND_ROOT" ]]; then
-  # listă stabilă, sortată
-  find "$DEMAND_ROOT" -type f \( -iname "*.wav" -o -iname "*.flac" \) \
-    | sort > data/lists/noise_all.txt || true
-else
-  : > data/lists/noise_all.txt
+has_wav() { find "$1" -type f -iname "*.wav" 2>/dev/null | head -n1 >/dev/null; }
+
+# --- (opțional) generează synth dacă nu ai NICIUN zgomot ---
+SYNTH_CANDIDATES=(
+  "make_synth_noises.py"
+  "scripts/make_synth_noises.py"
+  "datasets/make_synth_noises.py"
+  "data/datasets/make_synth_noises.py"
+)
+if ! has_wav "$DEMAND" && ! has_wav "$CUSTOM" && ! has_wav "$SYNTH"; then
+  for c in "${SYNTH_CANDIDATES[@]}"; do
+    if [[ -f "$c" ]]; then
+      echo "[prepare_noises] generating synth noises via $c"
+      python "$c"
+      break
+    fi
+  done
 fi
 
-total=$( (wc -l < data/lists/noise_all.txt) 2>/dev/null || echo 0 )
-train_n=$(( total * 80 / 100 ))
-dev_n=$(( total * 10 / 100 ))
-# test_n = restul
-test_n=$(( total - train_n - dev_n ))
+# ---------- NOISE TRAIN ----------
+: > "$LISTS/noise_train.txt"
+for D in "$DEMAND" "$CUSTOM" "$SYNTH"; do
+  if [[ -d "$D" ]]; then
+    find "$D" -type f -iname "*.wav" | sort >> "$LISTS/noise_train.txt"
+  fi
+done
 
-# Evităm SIGPIPE și folosim awk (nu `tail|head`)
-if (( total > 0 )); then
-  awk -v n="$train_n"          'NR<=n'  data/lists/noise_all.txt > data/lists/noise_train.txt
-  awk -v o="$train_n" -v n="$dev_n"     'NR>o && NR<=o+n' data/lists/noise_all.txt > data/lists/noise_dev.txt
-  awk -v o="$((train_n+dev_n))"         'NR>o' data/lists/noise_all.txt > data/lists/noise_test.txt
+# ---------- NOISE DEV ----------
+if [[ -d "$DEV_DIR" ]]; then
+  find "$DEV_DIR" -type f -iname "*.wav" | sort > "$LISTS/noise_dev.txt"
 else
-  : > data/lists/noise_train.txt
-  : > data/lists/noise_dev.txt
-  : > data/lists/noise_test.txt
-fi
-
-# --- 2) Zgomote sintetice (white/pink/brown/babble) ---
-# Detectăm corect calea scriptului (poate fi în repo la rădăcină sau sub data/)
-SYNTH_SCRIPT="datasets/make_synth_noises.py"
-if [[ ! -f "$SYNTH_SCRIPT" ]]; then
-  if [[ -f "data/datasets/make_synth_noises.py" ]]; then
-    SYNTH_SCRIPT="data/datasets/make_synth_noises.py"
+  # fallback: primele 200 din train
+  if [[ -s "$LISTS/noise_train.txt" ]]; then
+    head -n 200 "$LISTS/noise_train.txt" > "$LISTS/noise_dev.txt"
   else
-    echo "[prepare_noises] ERROR: nu găsesc datasets/make_synth_noises.py" >&2
-    exit 5
+    : > "$LISTS/noise_dev.txt"
   fi
 fi
 
-python "$SYNTH_SCRIPT"
-
-# listă sintetice
-find data/noise/synth -type f -name "*.wav" | sort > data/lists/noise_synth.txt || : 
-
-# --- 3) Unseen noises: dacă există sintetice, folosește-le ca unseen ---
-if [[ -s data/lists/noise_synth.txt ]]; then
-  cp -f data/lists/noise_synth.txt data/lists/noise_unseen.txt
+# ---------- NOISE UNSEEN ----------
+if [[ -d "$UNSEEN_DIR" ]]; then
+  find "$UNSEEN_DIR" -type f -iname "*.wav" | sort > "$LISTS/noise_unseen.txt"
 else
-  # fallback: unseen = test din DEMAND
-  cp -f data/lists/noise_test.txt data/lists/noise_unseen.txt || : 
+  if [[ -s "$LISTS/noise_train.txt" ]]; then
+    comm -23 <(sort "$LISTS/noise_train.txt") <(sort "$LISTS/noise_dev.txt") | shuf -n 50 > "$LISTS/noise_unseen.txt" || true
+  else
+    : > "$LISTS/noise_unseen.txt"
+  fi
 fi
 
-# --- 4) RIR list (dacă există) ---
-: "${RIRS_ROOT:=/data/RIRS_NOISES}"
-if [[ -d "$RIRS_ROOT" ]]; then
-  find "$RIRS_ROOT" -type f -name "*.wav" | sort > data/lists/rir_list.txt
+# ---------- NOISE TEST (alias dev, pentru compat) ----------
+cp -f "$LISTS/noise_dev.txt" "$LISTS/noise_test.txt"
+
+# ---------- RIRs ----------
+RIRS="${RIRS_ROOT:-$ROOT/rirs}"
+if [[ -d "$RIRS" ]]; then
+  find "$RIRS" -type f -iname "*.wav" | sort > "$LISTS/rir_list.txt" || true
 else
-  : > data/lists/rir_list.txt
+  : > "$LISTS/rir_list.txt" || true
 fi
 
-echo "[prepare_noises] lists:"
+# ---------- Rezumat ----------
 for f in noise_train.txt noise_dev.txt noise_test.txt noise_unseen.txt rir_list.txt; do
-  printf "  %s: " "$f"
-  (wc -l "data/lists/$f" 2>/dev/null) || echo "0 data/lists/$f"
+  n=0; [[ -f "$LISTS/$f" ]] && n=$(wc -l < "$LISTS/$f" || echo 0)
+  printf "  %-16s: %s %s/%s\n" "$f" "$n" "$LISTS" "$f"
 done
+
+# ---------- Sanity ----------
+if [[ ! -s "$LISTS/noise_train.txt" ]]; then
+  echo "[prepare_noises] ERROR: nu am găsit zgomote pentru train în $DEMAND / $CUSTOM / $SYNTH" >&2
+  exit 4
+fi
+
+echo "[prepare_noises] OK"

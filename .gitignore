@@ -17,7 +17,6 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Logs & temporare
-*.log
 *.tmp
 *.swp
 
@@ -31,8 +30,6 @@ build/
 LibriSpeech/
 VoiceBank_DEMAND/
 data/
-artifacts/
-
 
 # Python
 __pycache__/
@@ -57,12 +54,12 @@ build/
 # Data & artifacts
 /data/
 data/
-artifacts/
 results/
 reports/
 logs/
 wandb/
 runs/
+enhanced/
 
 # OS / Editor
 .DS_Store

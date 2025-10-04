@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, argparse, os, time, subprocess
+import json, argparse, os
 
 p=argparse.ArgumentParser()
 p.add_argument("--metrics", required=True)

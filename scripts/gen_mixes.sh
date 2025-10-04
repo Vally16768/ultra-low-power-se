@@ -3,10 +3,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-MIXGEN="datasets/mixgen.py"
-[[ -f "$MIXGEN" ]] || MIXGEN="data/datasets/mixgen.py"
+: "${MIXGEN:=datasets/mixgen.py}"
 if [[ ! -f "$MIXGEN" ]]; then
-  echo "[gen_mixes] ERROR: nu găsesc datasets/mixgen.py" >&2
+  [[ -f "data/datasets/mixgen.py" ]] && MIXGEN="data/datasets/mixgen.py"
+fi
+if [[ ! -f "$MIXGEN" ]]; then
+  echo "[gen_mixes] ERROR: nu găsesc $MIXGEN (setează MIXGEN în .env.local)" >&2
   exit 6
 fi
 
