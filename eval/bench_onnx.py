@@ -6,6 +6,7 @@ import numpy as np
 
 # ------------------------- metrici -------------------------
 
+
 def si_snr(ref, est, eps=1e-8):
     """Scale-Invariant SNR (Le Roux et al.)."""
     ref = ref.astype(np.float32, copy=False)
@@ -19,31 +20,40 @@ def si_snr(ref, est, eps=1e-8):
     den = float(np.sum(e_noise * e_noise)) + eps
     return 10.0 * np.log10(num / den)
 
+
 def delta_si_snr(ref, noisy, est):
     return float(si_snr(ref, est) - si_snr(ref, noisy))
+
 
 def metric_pesq(ref, est, sr=16000):
     try:
         from pesq import pesq
+
         return float(pesq(sr, ref, est, "wb"))
     except Exception:
         return None
 
+
 def metric_stoi(ref, est, sr=16000):
     try:
         from pystoi import stoi
+
         return float(stoi(ref, est, sr, extended=False))
     except Exception:
         return None
+
 
 def snr_impr(ref, noisy, est):
     def _snr(a, b):
         num = float(np.sum(a * a)) + 1e-9
         den = float(np.sum((a - b) * (a - b))) + 1e-9
         return 10.0 * np.log10(num / den)
+
     return float(_snr(ref, est) - _snr(ref, noisy))
 
+
 # ------------------------- I/O utilitare -------------------------
+
 
 def _to_mono(x: np.ndarray) -> np.ndarray:
     x = x.astype("float32", copy=False)
@@ -51,15 +61,17 @@ def _to_mono(x: np.ndarray) -> np.ndarray:
         return x.mean(axis=1)
     return x
 
+
 def _resample_linear(x: np.ndarray, fs_in: int, fs_out: int) -> np.ndarray:
     if fs_in == fs_out:
         return x
     n_out = int(round(len(x) * (fs_out / fs_in)))
     if n_out <= 1 or len(x) == 0:
         return np.zeros((0,), dtype=x.dtype)
-    t_in  = np.linspace(0.0, 1.0, num=len(x), endpoint=False, dtype="float64")
+    t_in = np.linspace(0.0, 1.0, num=len(x), endpoint=False, dtype="float64")
     t_out = np.linspace(0.0, 1.0, num=n_out, endpoint=False, dtype="float64")
     return np.interp(t_out, t_in, x.astype("float64")).astype("float32")
+
 
 def _sanitize(arr: np.ndarray) -> np.ndarray:
     arr = arr.astype("float32", copy=False)
@@ -68,8 +80,10 @@ def _sanitize(arr: np.ndarray) -> np.ndarray:
         arr[m] = 0.0
     return arr
 
+
 def load_rand(paths, target_len, sr):
     import soundfile as sf
+
     p = random.choice(paths)
     x, fs = sf.read(p, always_2d=False)
     x = _to_mono(x)
@@ -80,16 +94,19 @@ def load_rand(paths, target_len, sr):
         x = np.pad(x, (0, target_len - len(x)))
     elif len(x) > target_len:
         start = random.randint(0, len(x) - target_len)
-        x = x[start:start + target_len]
+        x = x[start : start + target_len]
     # else exact
     return _sanitize(x[:target_len])
 
+
 # ------------------------- niveluri & mix -------------------------
+
 
 def rms_dbfs(x, eps=1e-12):
     """RMS în dBFS pentru semnale float în [-1, 1] (convențional)."""
     rms = float(np.sqrt(np.mean(x.astype(np.float32) ** 2) + eps))
     return 20.0 * np.log10(rms + eps)
+
 
 def apply_rms_target(x, target_dbfs=-26.0, eps=1e-12):
     """Rescalează x la RMS target_dbfs dBFS (dacă x are energie)."""
@@ -99,6 +116,7 @@ def apply_rms_target(x, target_dbfs=-26.0, eps=1e-12):
     gain = 10.0 ** (gain_db / 20.0)
     y = x * gain
     return y.astype(np.float32)
+
 
 def mix(clean, noise, snr_db=5.0, peak_norm=0.0, eps=1e-12):
     """
@@ -116,7 +134,9 @@ def mix(clean, noise, snr_db=5.0, peak_norm=0.0, eps=1e-12):
             noisy = noisy * (peak_norm / peak)
     return _sanitize(noisy), _sanitize(clean)
 
+
 # ------------------------- main -------------------------
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -131,18 +151,17 @@ def main():
     ap.add_argument("--threads", type=int, default=0, help="intra_op_num_threads; 0=ORT default")
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--seed", type=int, default=404)
-    ap.add_argument("--peak-norm", type=float, default=0.95,
-                    help="dacă >0, scalează mixul la acest vârf (ex. 0.95) pt. a evita clipping")
-    ap.add_argument("--rms-target", type=float, default=-26.0,
-                    help="dBFS țintă pt. clean & noise înainte de mix; setează 0 pentru a dezactiva")
-    ap.add_argument("--level-both", action="store_true",
-                    help="dacă e setat, aplică RMS target la ambele semnale înainte de mix")
+    ap.add_argument("--peak-norm", type=float, default=0.95, help="dacă >0, scalează mixul la acest vârf (ex. 0.95) pt. a evita clipping")
+    ap.add_argument("--rms-target", type=float, default=-26.0, help="dBFS țintă pt. clean & noise înainte de mix; setează 0 pentru a dezactiva")
+    ap.add_argument("--level-both", action="store_true", help="dacă e setat, aplică RMS target la ambele semnale înainte de mix")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    random.seed(args.seed); np.random.seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
     import onnxruntime as ort
+
     so = ort.SessionOptions()
     if args.threads > 0:
         so.intra_op_num_threads = args.threads
@@ -183,10 +202,12 @@ def main():
 
         if "pesq" in scores:
             v = metric_pesq(clean, y, sr=args.sr)
-            if v is not None: scores["pesq"].append(v)
+            if v is not None:
+                scores["pesq"].append(v)
         if "stoi" in scores:
             v = metric_stoi(clean, y, sr=args.sr)
-            if v is not None: scores["stoi"].append(v)
+            if v is not None:
+                scores["stoi"].append(v)
         if "snr" in scores:
             scores["snr"].append(snr_impr(clean, noisy, y))
         if "sisnr" in scores:
@@ -212,6 +233,7 @@ def main():
     }
     Path(args.out).write_text(json.dumps(out, indent=2))
     print(json.dumps(out, indent=2))
+
 
 if __name__ == "__main__":
     main()

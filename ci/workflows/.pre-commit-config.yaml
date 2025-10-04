@@ -1,0 +1,20 @@
+repos:
+  # Reguli rapide: sort imports, lint + autofix
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [ "--fix" ]         # autofix lint unde se poate
+      - id: ruff-format           # formatare (pep8/black-style by ruff)
+
+  # Hooks generale utile
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: [ "auto" ]
+      - id: check-yaml
+      - id: debug-statements

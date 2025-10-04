@@ -74,7 +74,9 @@ def _bench(sess: ort.InferenceSession, secs: float = 5.0, T: int = 16000, sr: in
     x = np.random.randn(1, 1, T).astype(np.float32)
     for _ in range(5):
         sess.run([out_name], {in_name: x})
-    t0 = time.time(); n = 0; sig_time = 0.0
+    t0 = time.time()
+    n = 0
+    sig_time = 0.0
     while time.time() - t0 < secs:
         sess.run([out_name], {in_name: x})
         n += 1

@@ -1,6 +1,7 @@
 from pystoi.stoi import stoi as _stoi
 import numpy as np
 
+
 def stoi_score(ref: np.ndarray, deg: np.ndarray, sr: int = 16000, extended: bool = False) -> float:
     """
     Calculează STOI (sau eSTOI dacă extended=True).

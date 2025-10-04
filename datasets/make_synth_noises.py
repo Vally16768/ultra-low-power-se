@@ -6,7 +6,7 @@ OUT = Path("data/noise/synth")
 OUT.mkdir(parents=True, exist_ok=True)
 rng = np.random.default_rng(1337)
 
-def white(n): 
+def white(n):
     return rng.standard_normal(n).astype(np.float32) * 0.2
 
 def brown(n):

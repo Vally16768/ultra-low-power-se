@@ -1,264 +1,89 @@
-name: ultra-low-power-se CI
+name: CI
 
 on:
-  pull_request:
   push:
-    branches: [ main ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  pull-requests: write   # pentru comentariu pe PR
-
-env:
-  PYTHON_VERSION: "3.11"
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
 
 jobs:
-  lint_unit:
+  build:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - name: Install deps (lint/unit)
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest ruff mypy
-      - name: Ruff
-        run: ruff check .
-      - name: Mypy (tolerant dacă nu e src/)
-        run: mypy --install-types --non-interactive src || true
-      - name: Pytest (ok dacă nu ai teste)
-        run: pytest -q || true
+    strategy:
+      matrix:
+        py: [ "3.10", "3.11" ]
 
-  metrics_unit:
-    needs: [lint_unit]
-    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - name: Install deps (metrics)
-        run: |
-          python -m pip install --upgrade pip
-          pip install numpy soundfile
-          # opțional: PESQ/STOI (pot fi grele; dacă lipsesc, testele le sar)
-          pip install pesq pystoi || true
-      - name: Run metric fixtures
-        run: pytest -q tests/test_metrics_fixtures.py || true
-      - name: Upload unit-metrics junit (dacă ai)
-        if: hashFiles('reports/junit.xml') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit-metrics
-          path: reports/junit.xml
-          retention-days: 7
+      - name: Checkout
+        uses: actions/checkout@v4
 
-  build_images:
-    needs: [lint_unit]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build CPU image
-        run: |
-          if [ -f docker/Dockerfile.cpu ]; then
-            docker build -f docker/Dockerfile.cpu -t se-cpu:latest .
-          else
-            echo "No docker/Dockerfile.cpu; skipping build."
-          fi
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.py }}
 
-  train_smoke:
-    needs: [metrics_unit]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - name: Install light training deps
+      - name: Create venv & install project
         run: |
-          python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy soundfile tensorboard pyyaml
-      - name: Smoke train (1 epoch) or skip
-        run: |
-          CFG="configs/exp_mamba_unet.yaml"
-          if [ -f "$CFG" ]; then
-            python runners/train.py --config "$CFG" || true
-          else
-            echo "No $CFG; writing stub checkpoint."
-            mkdir -p artifacts/checkpoints/exp
-            echo "{}" > artifacts/checkpoints/exp/model.ckpt
-          fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: train-ckpt
-          path: artifacts/checkpoints/
-          retention-days: 7
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install -U pip wheel
+          pip install -e .
 
-  export_onnx_parity:
-    needs: [train_smoke]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - uses: actions/download-artifact@v4
-        with:
-          name: train-ckpt
-          path: artifacts/checkpoints/
-      - name: Install ONNX deps
+      - name: Install dev deps (ruff/mypy/pytest/onnx/onnxruntime)
         run: |
-          python -m pip install --upgrade pip
-          pip install onnx onnxruntime pyyaml numpy
+          . .venv/bin/activate
+          pip install -U ruff mypy pytest onnx onnxruntime
+
+      - name: Lint
+        run: |
+          . .venv/bin/activate
+          ruff check .
+
+      - name: Type check
+        run: |
+          . .venv/bin/activate
+          mypy .
+
+      - name: Tests (if any)
+        run: |
+          . .venv/bin/activate
+          if [ -d tests ]; then pytest -q; else echo "No tests/ directory — skipping"; fi
+
       - name: Export ONNX
         run: |
-          CFG="configs/exp_mamba_unet.yaml"
-          if [ ! -f "$CFG" ]; then
-            echo "experiment: { name: exp }" > "$CFG"
-          fi
-          python deploy/export_onnx.py --config "$CFG"
-      - name: Sanity report ONNX
-        run: |
-          python deploy/sanity_onnx.py artifacts/export/*.onnx --print-json > artifacts/export/sanity.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: onnx-export
-          path: |
-            artifacts/export/*.onnx
-            artifacts/export/sanity.json
-          retention-days: 7
+          . .venv/bin/activate
+          python deploy/export_onnx_min.py \
+            --config configs/exp_mamba_unet.yaml \
+            --out artifacts/export/mamba_unet_ci.onnx \
+            --opset 17 --sample_len 16000
 
-  infer_offline_and_score:
-    needs: [export_onnx_parity]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - uses: actions/download-artifact@v4
-        with:
-          name: onnx-export
-          path: artifacts/export/
-      - name: Install eval deps
+      - name: ONNX Sanity
         run: |
-          python -m pip install --upgrade pip
-          pip install onnxruntime numpy soundfile pystoi pesq
-      - name: Run eval on VoiceBank-mini if present, otherwise dummy metrics
-        run: |
-          mkdir -p artifacts/results
-          MODEL=$(ls artifacts/export/*.onnx | head -n1)
-          MAN="data/voicebank-mini/manifests/pairs_eval.csv"
-          if [ -f "$MAN" ]; then
-            python eval/bench_onnx.py --model "$MODEL" --manifest "$MAN" \
-              --scores pesq stoi snr --out artifacts/results/metrics.json || true
-          else
-            echo '{
-              "model":"'"$MODEL"'",
-              "aggregate":{"PESQ":3.12,"STOI":0.945,"DELTA_SNR":11.3,"SI_SDR":12.8},
-              "rows":[]
-            }' > artifacts/results/metrics.json
-          fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: metrics
-          path: artifacts/results/metrics.json
-          retention-days: 7
+          . .venv/bin/activate
+          python - <<'PY'
+          import onnx, onnxruntime as ort, numpy as np
+          m="artifacts/export/mamba_unet_ci.onnx"
+          onnx.checker.check_model(onnx.load(m))
+          s=ort.InferenceSession(m, providers=["CPUExecutionProvider"])
+          x=np.zeros((1,1,16000),np.float32)
+          y=s.run(["enhanced"],{"noisy":x})[0]
+          assert y.shape==(1,1,16000)
+          print("ONNX sanity OK:", y.shape)
+          PY
 
-  quantize_prune_rescore:
-    needs: [infer_offline_and_score]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      - uses: actions/download-artifact@v4
-        with:
-          name: onnx-export
-          path: artifacts/export/
-      - name: Install quant deps
+      - name: Parity (PT vs ONNX)
         run: |
-          python -m pip install --upgrade pip
-          pip install onnx onnxruntime numpy
-      - name: Quantize weight-only (fast) + (re)score lightweight
-        run: |
-          MODEL=$(ls artifacts/export/*.onnx | head -n1)
-          OUT=artifacts/export/model_int8.onnx
-          python deploy/quantize.py --method weight-only --model "$MODEL" --out "$OUT" || true
-          # opțional: re-score dacă ai manifest (altfel sari)
-          if [ -f data/voicebank-mini/manifests/pairs_eval.csv ]; then
-            python eval/bench_onnx.py --model "$OUT" --manifest data/voicebank-mini/manifests/pairs_eval.csv \
-              --scores pesq stoi snr --out artifacts/results/metrics_int8.json || true
-          fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: onnx-quant
-          path: |
-            artifacts/export/model_int8.onnx
-            artifacts/results/metrics_int8.json
-          if-no-files-found: ignore
-          retention-days: 7
+          . .venv/bin/activate
+          python tools/parity_onnx.py \
+            --model se_models.mamba_unet.model \
+            --config configs/exp_mamba_unet.yaml \
+            --onnx artifacts/export/mamba_unet_ci.onnx \
+            --T 16000 --tol 0.02
 
-  gate:
-    needs: [infer_offline_and_score]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: metrics
-          path: artifacts/results/
-      - name: Gate vs baseline
+      - name: Quantize (dynamic INT8)
         run: |
-          python scripts/ci_gate.py baselines/voicebank_mini_golden.json artifacts/results/metrics.json
-
-  pr_comment:
-    needs: [infer_offline_and_score, gate]
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: metrics
-          path: artifacts/results/
-      - name: Comment summary on PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const path = 'artifacts/results/metrics.json';
-            const data = JSON.parse(fs.readFileSync(path,'utf8'));
-            const agg = data.aggregate || {};
-            const body = [
-              '### 🔎 SE metrics (candidate)',
-              '',
-              `- **PESQ**: ${agg.PESQ ?? 'n/a'}`,
-              `- **STOI**: ${agg.STOI ?? 'n/a'}`,
-              `- **ΔSNR**: ${agg.DELTA_SNR ?? 'n/a'} dB`,
-              `- **SI-SDR**: ${agg.SI_SDR ?? 'n/a'} dB`,
-              '',
-              `Artifacts: \`${path}\``,
-            ].join('\n');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body
-            });
+          . .venv/bin/activate
+          python deploy/quantize_onnx.py \
+            --in_model artifacts/export/mamba_unet_ci.onnx \
+            --out_model artifacts/export/mamba_unet_ci.int8.onnx \
+            --weight_type QInt8

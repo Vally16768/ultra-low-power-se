@@ -1,194 +1,237 @@
-# runners/infer.py
+#!/usr/bin/env python3
+"""
+Inferență offline pentru Ultra-Low-Power SE.
+
+- Citește manifest CSV cu coloane: noisy[, clean]
+- Încarcă modelul conform configului + checkpoint-ul (safe: weights_only=True)
+- Rulează pe GPU dacă e disponibil
+- Scrie fișierele enhanced *.wav în outdir
+
+Puncte de intrare:
+- enhance_dataset(cfg)  -> folosit de runners/evaluate.py
+- main(cfg)             -> wrapper care face același lucru și returnează outdir
+"""
+
 from __future__ import annotations
-from typing import Dict, Any, Tuple, Iterable
-from pathlib import Path
-import importlib
+import os
 import csv
+import importlib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional, List
 
 import numpy as np
 import soundfile as sf
 import torch
-import torch.nn as nn
-
-from ._resolve import resolve_pathlike
-
-
-def _mono(x: np.ndarray) -> np.ndarray:
-    return x if x.ndim == 1 else x.mean(axis=1)
+from torch import nn
+from tqdm import tqdm
 
 
-def _load_manifest(p: str | Path) -> Iterable[Tuple[str, str]]:
-    with open(p, "r", newline="") as f:
-        r = csv.DictReader(f)
-        if "noisy" not in r.fieldnames or "clean" not in r.fieldnames:
-            raise SystemExit(f"[infer] Manifestul {p} trebuie să aibă coloanele: noisy, clean")
-        for row in r:
-            yield row["noisy"], row["clean"]
+# ---------------------- Utils ----------------------
+def _resolve_build_fn(module_spec: str):
+    """
+    Acceptă:
+      - "pkg.subpkg.module:build_model"  -> returnează funcția build_model
+      - "pkg.subpkg.module"              -> caută atributul `build_model`
+    """
+    if ":" in module_spec:
+        mod, fn = module_spec.split(":", 1)
+        m = importlib.import_module(mod)
+        if not hasattr(m, fn):
+            raise RuntimeError(f"Nu găsesc factory '{fn}' în modulul '{mod}'")
+        return getattr(m, fn)
+    # fallback: caută build_model
+    m = importlib.import_module(module_spec)
+    if not hasattr(m, "build_model"):
+        raise RuntimeError(f"Modulul '{module_spec}' nu conține 'build_model'")
+    return m.build_model
 
 
-def _resolve_builder(mod_path: str):
-    if ":" in mod_path:
-        pkg, fn = mod_path.split(":", 1)
-        mod = importlib.import_module(pkg)
-        return getattr(mod, fn)
-    mod = importlib.import_module(mod_path)
-    if hasattr(mod, "build_model"):
-        return getattr(mod, "build_model")
-    if hasattr(mod, "Net"):
-        def _wrap(cfg=None):
-            try:
-                return mod.Net(cfg)
-            except TypeError:
-                return mod.Net()
-        return _wrap
-    raise SystemExit(f"[infer] Nu găsesc builder în modulul: {mod_path}")
+def _strip_module_prefix(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if any(k.startswith("module.") for k in state.keys()):
+        return {k.replace("module.", "", 1): v for k, v in state.items()}
+    return state
 
 
-def _strip_module(sd):
-    from collections import OrderedDict
-    out = OrderedDict()
-    for k, v in sd.items():
-        out[k[7:]] = v if k.startswith("module.") else v
+def _load_state_safely(model: nn.Module, ckpt_path: Path, strict_load: bool = True) -> Tuple[List[str], List[str]]:
+    """
+    Încarcă un checkpoint PyTorch în siguranță (fără pickle arbitrar).
+    - torch.load(..., weights_only=True) -> PyTorch 2.4+
+    - Acceptă structuri {state_dict=..., ...} sau dict direct de greutăți.
+    - Elimină prefixul "module." dacă checkpoint-ul provine din DataParallel.
+    """
+    obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+    if isinstance(obj, dict) and any(k in obj for k in ("state_dict", "model", "net")):
+        state = obj.get("state_dict") or obj.get("model") or obj.get("net")
+    else:
+        state = obj  # probabil e direct un state_dict
+
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Structură checkpoint neașteptată în: {ckpt_path}")
+
+    state = _strip_module_prefix(state)
+    missing, unexpected = model.load_state_dict(state, strict=False)  # diagnostic mai întâi
+
+    if missing or unexpected:
+        print(f"[infer] DIAGNOSTIC mismatch: missing={len(missing)}, unexpected={len(unexpected)}")
+        if len(missing) <= 8 and len(unexpected) <= 8:
+            if missing:
+                print("  missing:", missing)
+            if unexpected:
+                print("  unexpected:", unexpected)
+
+    if strict_load:
+        # Reîncercăm strict ca să fail-fast dacă există diferențe reale
+        model.load_state_dict(state, strict=True)
+        return [], []
+
+    return list(missing), list(unexpected)
+
+
+def _to_mono(x: np.ndarray) -> np.ndarray:
+    if x.ndim == 2:
+        return x.mean(axis=1)
+    return x
+
+
+# ---------------------- Dataclass cfg ----------------------
+@dataclass
+class EvalPaths:
+    manifest: Path
+    outdir: Path
+
+
+@dataclass
+class Cfg:
+    sample_rate: int
+    model_module: str
+    checkpoint: Path
+    eval_paths: EvalPaths
+
+
+def _build_cfg(cfg: Dict[str, Any]) -> Cfg:
+    # data.sample_rate
+    sr = int(cfg.get("data", {}).get("sample_rate", 16000))
+
+    # model.module (poate veni și din env: MODEL_MODULE)
+    model_mod = cfg.get("model", {}).get("module") or os.getenv("MODEL_MODULE")
+    if not model_mod:
+        # fallback compat vechi
+        model_mod = cfg.get("model", {}).get("MODEL_MODULE") or "se_models.mamba_unet.model:build_model"
+
+    # inference.checkpoint (preferăm explicit)
+    ckpt = cfg.get("inference", {}).get("checkpoint")
+    if not ckpt:
+        maybe = Path("artifacts/exp/mamba_unet_v0/best.ckpt")
+        if maybe.exists():
+            print(f"[infer] WARNING: checkpoint inexistent în cfg -> folosesc fallback: {maybe}")
+            ckpt = str(maybe)
+        else:
+            raise SystemExit("Nu ai setat inference.checkpoint și nu găsesc fallback.")
+
+    # eval.manifest + eval.outdir
+    manifest = cfg.get("eval", {}).get("manifest") or cfg.get("eval", {}).get("offline_manifest") or "data/prepared/voicebank/test/manifests/pairs.csv"
+    outdir = cfg.get("eval", {}).get("outdir") or "artifacts/eval/mamba_unet/enhanced"
+
+    return Cfg(
+        sample_rate=sr,
+        model_module=model_mod,
+        checkpoint=Path(ckpt),
+        eval_paths=EvalPaths(
+            manifest=Path(manifest),
+            outdir=Path(outdir),
+        ),
+    )
+
+
+# ---------------------- Infer core ----------------------
+def _read_manifest(path: Path) -> List[tuple[str, str | None]]:
+    rows: List[tuple[str, str | None]] = []
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        cols = {c.strip().lower() for c in (reader.fieldnames or [])}
+        if "noisy" not in cols:
+            raise RuntimeError(f"Manifest-ul trebuie să conțină coloana 'noisy': {path}")
+        for r in reader:
+            noisy = r["noisy"]
+            clean = r.get("clean")
+            rows.append((noisy, clean))
+    return rows
+
+
+def _enhance_file(model: nn.Module, wav: np.ndarray, device: torch.device) -> np.ndarray:
+    wav = _to_mono(wav.astype(np.float32))
+    t = torch.from_numpy(wav)[None, None, :]  # [B=1, C=1, T]
+    t = t.to(device, non_blocking=True)
+    with torch.no_grad():
+        out = model(t)
+    if out.ndim == 3:  # [B,1,T]
+        out = out[:, 0, :]
+    out = out.squeeze(0).detach().cpu().float().numpy()
     return out
 
-def _try_load_ckpt(model, ckpt_path: str):
-    import torch
-    from pathlib import Path
-    p = Path(ckpt_path).expanduser()
-    if not p.exists():
-        print(f"[infer] WARNING: checkpoint inexistent: {p}")
-        return False
-    obj = torch.load(str(p), map_location="cpu")
-    sd = None
-    for key in ("state_dict", "model", "net", "weights"):
-        if isinstance(obj, dict) and key in obj and isinstance(obj[key], dict):
-            sd = obj[key]; break
-    if sd is None:
-        sd = obj if isinstance(obj, dict) else None
-    if not isinstance(sd, dict):
-        print(f"[infer] WARNING: format checkpoint neînțeles: {type(obj)}")
-        return False
-    sd = _strip_module(sd)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    print(f"[infer] loaded checkpoint: {p.name}  (missing={len(missing)}, unexpected={len(unexpected)})")
-    return True
 
-def _autodiscover_ckpt(cfg):
-    from pathlib import Path
-    exp = cfg.get("experiment", {})
-    root = Path(exp.get("out_dir", "artifacts/exp")) / exp.get("name", "")
-    cands = []
-    if root.exists():
-        cands += list(root.rglob("*.ckpt"))
-        cands += list(root.rglob("*.pt"))
-        cands += list(root.rglob("*.pth"))
-    if not cands:
-        return None
-    # preferă “best” apoi cele mai noi
-    cands = sorted(cands, key=lambda p: (("best" not in p.name.lower()), -p.stat().st_mtime))
-    return str(cands[0])
-
-def _build_model(cfg: Dict[str, Any]) -> nn.Module:
-    modpath = cfg.get("model", {}).get("module", "se_models.mamba_unet.model:build_model")
-    builder = _resolve_builder(modpath)
-    try:
-        model = builder(cfg)
-    except TypeError:
-        model = builder()
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    from pathlib import Path
-    ckpt_cfg = cfg.get("model", {}).get("checkpoint")
-    ckpt_eff = None
-    if ckpt_cfg and Path(ckpt_cfg).expanduser().exists():
-        ckpt_eff = ckpt_cfg
-        print(f"[infer] using checkpoint from cfg: {ckpt_eff}")
-    else:
-        if ckpt_cfg:
-            print(f"[infer] WARNING: checkpoint inexistent în cfg: {ckpt_cfg} → încerc autodiscover")
-        auto = _autodiscover_ckpt(cfg)
-        if auto:
-            ckpt_eff = auto
-            print(f"[infer] autodiscovered checkpoint: {ckpt_eff}")
-
-    if ckpt_eff:
-        _try_load_ckpt(model, ckpt_eff)
-    else:
-        print("[infer] WARNING: rulez FĂRĂ checkpoint (model random)")
-
-    return model
-
-
-@torch.no_grad()
-def enhance_dataset(cfg: Dict[str, Any], manifest: str | Path, outdir: str | Path, sr: int) -> None:
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    model = _build_model(cfg)
+def _prepare_model(C: Cfg, cfg: Dict[str, Any]) -> tuple[nn.Module, torch.device]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[infer] device: {device}")
+
+    build_fn = _resolve_build_fn(C.model_module)
+    model: nn.Module = build_fn(cfg) if build_fn.__code__.co_argcount else build_fn()
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[model] total params: {n_params/1e6:.2f}M")
+
+    if not C.checkpoint.exists():
+        raise SystemExit(f"Checkpoint inexistent: {C.checkpoint}")
+    _load_state_safely(model, C.checkpoint, strict_load=True)
+
     model.to(device)
-
-    for noisy_path, _clean_path in _load_manifest(manifest):
-        npath = Path(noisy_path)
-        x, srx = sf.read(npath, always_2d=False)
-        x = _mono(np.asarray(x, dtype=np.float32))
-        if srx != sr:
-            raise SystemExit(f"[infer] SR diferit ({srx}) pentru {npath}. Resamplează la {sr} Hz.")
-
-        xt = torch.from_numpy(x).float().to(device).view(1, 1, -1)
-        y = model(xt)
-        if isinstance(y, (tuple, list)):
-            y = y[0]
-        y = y.squeeze().detach().cpu().numpy()
-
-        out_wav = outdir / npath.name
-        sf.write(out_wav, y, sr)
-    print(f"[infer] wrote enhanced wavs to {outdir}")
+    model.eval()
+    return model, device
 
 
-def main(cfg: Dict[str, Any]) -> int:
-    sr = int(cfg.get("eval", {}).get("sr") or cfg.get("data", {}).get("sample_rate", 16000))
+def enhance_dataset(
+    cfg: Dict[str, Any],
+    manifest: str | None = None,
+    outdir: str | None = None,
+    sr: int | None = None,
+) -> str:
+    """
+    Punctul de intrare folosit de runners/evaluate.py.
+    Permite suprascrierea manifest/outdir/sr prin argumente.
+    Returnează calea outdir unde s-au scris fișierele enhanced.
+    """
+    C = _build_cfg(cfg)
 
-    manifest = (
-        cfg.get("inference", {}).get("manifest")
-        or cfg.get("eval", {}).get("offline", {}).get("manifest")
-        or cfg.get("data", {}).get("manifests", {}).get("test_offline")
-    )
-    manifest_res = resolve_pathlike(manifest, cfg)
-    outdir = resolve_pathlike(
-        cfg.get("eval", {}).get("offline", {}).get("outdir") or "artifacts/eval/mamba_unet/enhanced",
-        cfg
-    )
-    if manifest_res:
-        enhance_dataset(cfg, manifest_res, outdir, sr=sr)
-        return 0
+    # suprascrieri venite din evaluate.py
+    if sr is not None:
+        C.sample_rate = int(sr)
+    if manifest is not None:
+        C.eval_paths.manifest = Path(manifest)
+    if outdir is not None:
+        C.eval_paths.outdir = Path(outdir)
 
-    # fallback single-file demo
-    in_wav = resolve_pathlike(cfg.get("inference", {}).get("in_wav"), cfg)
-    out_wav = resolve_pathlike(cfg.get("inference", {}).get("out_wav", "artifacts/demo_out.wav"), cfg)
+    C.eval_paths.outdir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _build_model(cfg).to(device).eval()
+    model, device = _prepare_model(C, cfg)
+    pairs = _read_manifest(C.eval_paths.manifest)
+    print(f"[infer] {len(pairs)} fișiere din manifest: {C.eval_paths.manifest}")
+    print(f"[infer] sample_rate={C.sample_rate}  outdir={C.eval_paths.outdir}")
 
-    if in_wav and Path(in_wav).exists():
-        x, sr0 = sf.read(in_wav)
-        x = _mono(np.asarray(x, dtype=np.float32))
-        if sr0 != sr:
-            raise SystemExit(f"Sample-rate mismatch: file={sr0} vs cfg={sr}")
-        xt = torch.from_numpy(x).float().to(device).view(1, 1, -1)
-    else:
-        T = sr * int(cfg.get("inference", {}).get("seconds", 1))
-        xt = torch.randn(1, 1, T, device=device)
+    for noisy, _ in tqdm(pairs, desc="enhance", unit="file"):
+        x, sr_file = sf.read(noisy, always_2d=False)
+        if sr_file != C.sample_rate:
+            raise RuntimeError(f"SR curent ({sr_file}) diferă de config ({C.sample_rate}) pentru: {noisy}")
+        y = _enhance_file(model, x, device)
+        sf.write(C.eval_paths.outdir / Path(noisy).name, y, samplerate=sr_file)
 
-    with torch.no_grad():
-        y = model(xt)
-        if isinstance(y, (tuple, list)):
-            y = y[0]
-        y = y.squeeze().detach().cpu().numpy()
+    print(f"[infer] wrote enhanced wavs to {C.eval_paths.outdir}")
+    return str(C.eval_paths.outdir)
 
-    Path(out_wav).parent.mkdir(parents=True, exist_ok=True)
-    sf.write(out_wav, y, sr)
-    print(f"[infer] wrote {out_wav}")
-    return 0
+
+def main(cfg: Dict[str, Any]) -> str:
+    """Wrapper compatibil cu runnerul generic; returnează outdir."""
+    return enhance_dataset(cfg)
+
+
+if __name__ == "__main__":
+    raise SystemExit("Rulează prin: python -m se_cli.cli eval --config <yaml>")

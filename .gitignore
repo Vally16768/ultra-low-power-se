@@ -66,3 +66,6 @@ enhanced/
 Thumbs.db
 .vscode/
 .idea/
+
+.cache/
+*.log
