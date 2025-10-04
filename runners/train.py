@@ -1,23 +1,26 @@
 # runners/train.py
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Trainer pentru Ultra-Low-Power SE.
 - Primește 'cfg' din se_cli.cli (nu folosește argparse).
 - Citește manifest-urile (CSV cu coloane: noisy, clean).
 - Pierderi: L1 (time) + MR-STFT (mag L1 + spectral convergence) + SI-SDR (maximizat).
-- Adaptive LR: ReduceLROnPlateau (config din YAML).
+- Adaptive LR: ReduceLROnPlateau (config din YAML) — cu filtrare de kwargs pt. compatibilitate.
 - Early Stopping pe val_loss (config din YAML).
 - Checkpoint: last.ckpt, best.ckpt; TensorBoard în <outdir>/tb.
 - Import model: model.module (YAML) / MODEL_MODULE (env) -> model.py (root) -> se_models.mamba_unet.model -> U-Net 1D fallback.
 """
 
+from __future__ import annotations
 import os
 import csv
 import json
 import time
 import random
+import inspect
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 
 import numpy as np
 import soundfile as sf
@@ -34,7 +37,8 @@ def _set_seed(s: int):
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
-    torch.cuda.manual_seed_all(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
 
 
 def _load_wav_mono16k(path: str | Path, target_sr: int = 16000) -> np.ndarray:
@@ -64,14 +68,16 @@ def _stft_mag(x: torch.Tensor, n_fft: int, hop: int, win: int) -> torch.Tensor:
     """x: [B,T] -> |STFT|: [B, F, T'] """
     window = torch.hann_window(win, device=x.device)
     X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win,
-                   window=window, return_complex=True)
+                   window=window, return_complex=True, center=True)
     return torch.abs(X)
 
 
 def _mrstft_loss(pred: torch.Tensor, target: torch.Tensor,
-                 cfg: Tuple[Tuple[int, int, int], ...] = ((256, 64, 256),
-                                                         (512, 128, 512),
-                                                         (1024, 256, 1024))) -> Tuple[torch.Tensor, torch.Tensor]:
+                 cfg: Tuple[Tuple[int, int, int], ...] = (
+                     (256, 64, 256),
+                     (512, 128, 512),
+                     (1024, 256, 1024),
+                 )) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Multi-Resolution STFT loss:
       - mag_l1: L1 pe magnitudini
@@ -102,7 +108,7 @@ class _PairsDataset(Dataset):
     """
     def __init__(self, manifest_csv: str | Path, segment_len: int = 32000,
                  sr: int = 16000, random_crop: bool = True):
-        self.items: list[tuple[str, str]] = []
+        self.items: List[tuple[str, str]] = []
         self.sr = sr
         self.seg = segment_len
         self.random_crop = random_crop
@@ -263,6 +269,22 @@ def _get_model_from_repo(cfg: Dict[str, Any]) -> nn.Module:
     return _SmallUNet1D()
 
 
+# ------------------ Helpers opt/sched ------------------
+def _safe_build_plateau(optimizer, **kwargs):
+    """
+    Construiește ReduceLROnPlateau filtrând argumentele necunoscute
+    (pt. compatibilitate cu versiuni mai vechi de PyTorch).
+    """
+    cls = torch.optim.lr_scheduler.ReduceLROnPlateau
+    sig = inspect.signature(cls.__init__)
+    allowed = set(sig.parameters.keys())  # {'self','optimizer',...}
+    safe_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+    dropped = [k for k in kwargs.keys() if k not in allowed]
+    if dropped:
+        print(f"[sched] Ignor argumente nesuportate pentru ReduceLROnPlateau: {dropped}")
+    return cls(optimizer=optimizer, **safe_kwargs)
+
+
 # ------------------ Antrenare / Validare ------------------
 def _run_epoch(model: nn.Module, loader: DataLoader, optimizer, scaler,
                device: torch.device, train: bool, loss_cfg: Dict[str, float]) -> Tuple[float, float]:
@@ -272,13 +294,16 @@ def _run_epoch(model: nn.Module, loader: DataLoader, optimizer, scaler,
     n_frames = 0
 
     bar = tqdm(loader, desc="train" if train else "valid", leave=False)
+    use_amp = bool(loss_cfg.get("amp", False)) and device.type == "cuda"
+    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+
     for noisy, clean, lengths in bar:
         noisy = noisy.to(device)   # [B,1,T]
         clean = clean.to(device)   # [B,1,T]
 
         with torch.set_grad_enabled(train):
-            with torch.autocast(device.type, enabled=loss_cfg["amp"]):
-                pred = model(noisy).squeeze(1)   # [B,T] (model poate întoarce [B,1,T])
+            with torch.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
+                pred = model(noisy).squeeze(1)   # [B,T]
                 clean_mono = clean.squeeze(1)    # [B,T]
 
                 l_time = F.l1_loss(pred, clean_mono)
@@ -293,7 +318,7 @@ def _run_epoch(model: nn.Module, loader: DataLoader, optimizer, scaler,
 
             if train:
                 optimizer.zero_grad(set_to_none=True)
-                if scaler:
+                if scaler is not None and use_amp:
                     scaler.scale(loss).backward()
                     nn.utils.clip_grad_norm_(model.parameters(), loss_cfg["grad_clip"])
                     scaler.step(optimizer)
@@ -328,15 +353,23 @@ def main(cfg: Dict[str, Any]):
     batch    = int(train_cfg.get("batch_size", 8))
     lr       = float(train_cfg.get("lr", 2e-4))
     seed     = int(train_cfg.get("seed", 1337))
+    num_workers = int(train_cfg.get("num_workers", 4))
 
     # scheduler config (adaptive LR)
     sched_cfg = (train_cfg.get("scheduler") or {})
-    sched_mode     = str(sched_cfg.get("mode", "min"))
-    sched_factor   = float(sched_cfg.get("factor", 0.5))
-    sched_patience = int(sched_cfg.get("patience", 5))
-    sched_min_lr   = float(sched_cfg.get("min_lr", 1e-6))
-    sched_cooldown = int(sched_cfg.get("cooldown", 0))
-    sched_verbose  = bool(sched_cfg.get("verbose", True))
+    sched_args = {
+        "mode":      str(sched_cfg.get("mode", "min")),
+        "factor":    float(sched_cfg.get("factor", 0.5)),
+        "patience":  int(sched_cfg.get("patience", 5)),
+        "cooldown":  int(sched_cfg.get("cooldown", 0)),
+        "min_lr":    float(sched_cfg.get("min_lr", 1e-6)),
+        # 'verbose' poate lipsi în unele versiuni de PyTorch → filtrăm în _safe_build_plateau
+        "verbose":   bool(sched_cfg.get("verbose", False)),
+        # threshold/threshold_mode pot exista în unele configuri; suportăm dacă le are versiunea
+        "threshold": float(sched_cfg.get("threshold", 1e-4)),
+        "threshold_mode": str(sched_cfg.get("threshold_mode", "rel")),
+        "eps": float(sched_cfg.get("eps", 1e-8)),
+    }
 
     # early stopping
     es_cfg      = (train_cfg.get("early_stopping") or {})
@@ -348,8 +381,10 @@ def main(cfg: Dict[str, Any]):
     outdir   = out_root / exp_name
     outdir.mkdir(parents=True, exist_ok=True)
 
-    train_manifest = data_cfg.get("train_manifest", "data/prepared/train_mixes/manifests/pairs.csv")
-    val_manifest   = data_cfg.get("val_manifest",   "data/prepared/dev_mixes/manifests/pairs.csv")
+    train_manifest = data_cfg.get("train_manifest", "data/prepared/mix/train/manifests/pairs.csv")
+    val_manifest   = data_cfg.get("val_manifest",   "data/prepared/mix/val/manifests/pairs.csv")
+    if not Path(train_manifest).exists() or not Path(val_manifest).exists():
+        raise FileNotFoundError(f"Manifest lipsă. train='{train_manifest}', val='{val_manifest}'")
 
     # ---- seed, device, logs ----
     _set_seed(seed)
@@ -359,28 +394,30 @@ def main(cfg: Dict[str, Any]):
 
     # ---- model & loaders ----
     model = _get_model_from_repo(cfg).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[model] total params: {n_params/1e6:.2f}M")
 
     train_ds = _PairsDataset(train_manifest, segment_len=seg_len, sr=sr, random_crop=True)
     val_ds   = _PairsDataset(val_manifest,   segment_len=seg_len, sr=sr, random_crop=False)
-    train_ld = DataLoader(train_ds, batch_size=batch, shuffle=True,  num_workers=4,
-                          collate_fn=_collate_pad, pin_memory=True)
-    val_ld   = DataLoader(val_ds,   batch_size=batch, shuffle=False, num_workers=4,
-                          collate_fn=_collate_pad, pin_memory=True)
+    train_ld = DataLoader(train_ds, batch_size=batch, shuffle=True,  num_workers=num_workers,
+                          collate_fn=_collate_pad, pin_memory=(device.type == "cuda"))
+    val_ld   = DataLoader(val_ds,   batch_size=batch, shuffle=False, num_workers=num_workers,
+                          collate_fn=_collate_pad, pin_memory=(device.type == "cuda"))
 
     # ---- opt/sched/amp ----
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode=sched_mode, factor=sched_factor, patience=sched_patience,
-        cooldown=sched_cooldown, min_lr=sched_min_lr, verbose=sched_verbose)
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    scheduler = _safe_build_plateau(optimizer, **sched_args)
+
+    amp_enabled = bool(train_cfg.get("amp", True)) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled) if device.type == "cuda" else None
 
     loss_cfg: Dict[str, float] = {
-        "amp": True,
-        "grad_clip": 5.0,
-        "w_time": 0.2,
-        "w_mag": 0.6,
-        "w_sc": 0.2,
-        "w_sisdr": 1.0,
+        "amp": float(amp_enabled),     # doar semnal pt. _run_epoch
+        "grad_clip": float(train_cfg.get("grad_clip", 5.0)),
+        "w_time": float(train_cfg.get("w_time", 0.2)),
+        "w_mag":  float(train_cfg.get("w_mag", 0.6)),
+        "w_sc":   float(train_cfg.get("w_sc", 0.2)),
+        "w_sisdr":float(train_cfg.get("w_sisdr", 1.0)),
     }
 
     best_val = float("inf")

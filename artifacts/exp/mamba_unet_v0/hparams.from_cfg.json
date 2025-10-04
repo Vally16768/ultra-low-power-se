@@ -1,0 +1,42 @@
+{
+  "experiment": {
+    "name": "mamba_unet_v0",
+    "out_dir": "artifacts/exp"
+  },
+  "data": {
+    "sample_rate": 16000,
+    "train_manifest": "data/prepared/mix/train/manifests/pairs.csv",
+    "val_manifest": "data/prepared/mix/val/manifests/pairs.csv"
+  },
+  "model": {
+    "module": "se_models.mamba_unet.model",
+    "name": "mamba_unet",
+    "in_ch": 1,
+    "base": 32
+  },
+  "train": {
+    "epochs": 50,
+    "batch_size": 8,
+    "lr": 0.0002,
+    "segment_sec": 4.0,
+    "seed": 1337,
+    "num_workers": 4,
+    "amp": true,
+    "grad_clip": 5.0,
+    "w_time": 0.2,
+    "w_mag": 0.6,
+    "w_sc": 0.2,
+    "w_sisdr": 1.0,
+    "scheduler": {
+      "mode": "min",
+      "factor": 0.5,
+      "patience": 5,
+      "min_lr": 1e-06,
+      "cooldown": 0
+    },
+    "early_stopping": {
+      "patience": 10,
+      "min_delta": 0.0
+    }
+  }
+}

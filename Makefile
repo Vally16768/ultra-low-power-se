@@ -43,6 +43,9 @@ UNIFIED_SCRIPT ?= scripts/build_unified_dataset.py
 # Model module (override în .env.local dacă vrei alt model)
 MODEL_MODULE ?= se_models.mamba_unet.model
 
+# PYTHONPATH pentru a face vizibile pachetele locale (se_cli, se_models, etc.)
+PYTHONPATH ?= $(PWD)
+
 # ---------- Dirs Lists & Stamps ----------
 LISTS_DIR      := lists
 CLEAN_LIST     := $(LISTS_DIR)/clean.txt
@@ -86,7 +89,7 @@ CLIPPING      ?= none      # none|hard|soft
         noise.ensure noise.verify \
         dataset-unified dataset-unified.clean \
         train tb logs export onnx onnx-verify onnx-verify-sim onnx-sanity \
-        infer eval print-vars check-scripts \
+        enhance infer eval print-vars check-scripts \
         clean clean-all clean-tb
 
 # ---------- Help ----------
@@ -110,24 +113,25 @@ help:
 > @echo "  dataset-unified.clean - remove unified dataset folder"
 > @echo "  train               - run training via se_cli (cfg YAML controlează tot)"
 > @echo "  tb                  - launch TensorBoard on artifacts"
-> @echo "  logs                - tail -f training log (stdout mirror)"
+> @echo "  logs                - tail -f last training log (stdout mirror)"
 > @echo "  export              - export ONNX (static input=noisy -> [B,1,T])"
 > @echo "  onnx                - alias pt. onnx-verify"
 > @echo "  onnx-verify         - verify ONNX vs PyTorch outputs"
 > @echo "  onnx-verify-sim     - verify ONNX (sim)"
 > @echo "  onnx-sanity         - parity Torch vs ONNX (script extra)"
-> @echo "  print-vars          - show key env/paths used by the pipeline"
+> @echo "  enhance / infer     - run inference via se_cli enhance"
+> @echo "  eval                - run evaluation via se_cli"
 > @echo "  clean / clean-all / clean-tb"
 
 # ---------- Env / Deps ----------
 ensure-venv:
 > if [ ! -d "$(VENV)" ]; then \
->   $(PYTHON) -m venv $(VENV); \
+>   $(PYTHON) -m venv "$(VENV)"; \
 > fi
 
 setup: ensure-venv
 > $(ACTIVATE) && python -m pip install --upgrade pip
-> test -f $(REQ_FILE) && $(ACTIVATE) && pip install -r $(REQ_FILE) || true
+> test -f "$(REQ_FILE)" && $(ACTIVATE) && pip install -r "$(REQ_FILE)" || true
 
 setup-dev: ensure-venv
 > $(ACTIVATE) && pip install -U pip ruff mypy pytest
@@ -199,7 +203,7 @@ lists: $(LISTS_STAMP)
 > @echo "[lists] OK → $(CLEAN_LIST)  $(NOISE_LIST)  $(RIRS_LIST)"
 
 lists.clean:
-> rm -f $(CLEAN_LIST) $(NOISE_LIST) $(RIRS_LIST) $(LISTS_STAMP) $(LISTS_DIR_STAMP)
+> rm -f "$(CLEAN_LIST)" "$(NOISE_LIST)" "$(RIRS_LIST)" "$(LISTS_STAMP)" "$(LISTS_DIR_STAMP)"
 
 # ---------- Sources ensure (idempotent via stamps) ----------
 $(LIBRISPEECH_STAMP):
@@ -210,7 +214,7 @@ $(LIBRISPEECH_STAMP):
 >   test -f scripts/get_librispeech.sh || { echo "[ERR] scripts/get_librispeech.sh missing"; exit 2; }; \
 >   bash scripts/get_librispeech.sh "$(LIBRISPEECH_ROOT)"; \
 > fi
-> touch $@
+> touch "$@"
 
 $(DEMAND_STAMP):
 > @echo "[datasets] check DEMAND at $(DEMAND_ROOT)"
@@ -220,7 +224,7 @@ $(DEMAND_STAMP):
 >   test -f scripts/get_demand.sh || { echo "[ERR] scripts/get_demand.sh missing"; exit 2; }; \
 >   bash scripts/get_demand.sh "$(DEMAND_ROOT)"; \
 > fi
-> touch $@
+> touch "$@"
 
 $(RIRS_STAMP):
 > @echo "[datasets] check RIRS at $(RIRS_ROOT)"
@@ -229,7 +233,7 @@ $(RIRS_STAMP):
 > else \
 >   test -f scripts/get_rirs.sh || { echo "[WARN] scripts/get_rirs.sh missing; continuing without RIRS."; }; \
 > fi
-> touch $@
+> touch "$@"
 
 $(VBD_STAMP):
 > @echo "[datasets] check VoiceBank-DEMAND at $(VBD_ROOT)"
@@ -239,7 +243,7 @@ $(VBD_STAMP):
 >   test -f scripts/get_voicebank_demand.sh || { echo "[ERR] scripts/get_voicebank_demand.sh missing"; exit 2; }; \
 >   bash scripts/get_voicebank_demand.sh "$(VBD_ROOT)"; \
 > fi
-> touch $@
+> touch "$@"
 
 # ---------- Mix generation (idempotent via mixgen verify/manifest) ----------
 $(MIX_TRAIN_STAMP): $(LIBRISPEECH_STAMP) $(DEMAND_STAMP) $(RIRS_STAMP) $(LISTS_STAMP)
@@ -260,14 +264,14 @@ $(MIX_TRAIN_STAMP): $(LIBRISPEECH_STAMP) $(DEMAND_STAMP) $(RIRS_STAMP) $(LISTS_S
 >   --segment-min $(SEG_MIN) \
 >   --segment-max $(SEG_MAX)
 > $(ACTIVATE) && python "$(MIXGEN)" \
-  --clean-list "$(CLEAN_LIST)" \
-  --noise-list "$(NOISE_LIST)" \
-  --rir-list   "$(RIRS_LIST)" \
-  --out-dir    "$(MIX_TRAIN_DIR)" \
-  --snr        $(SNR) \
-  --sr         $(SR) \
-  --verify-only
-> touch $@
+>   --clean-list "$(CLEAN_LIST)" \
+>   --noise-list "$(NOISE_LIST)" \
+>   --rir-list   "$(RIRS_LIST)" \
+>   --out-dir    "$(MIX_TRAIN_DIR)" \
+>   --snr        $(SNR) \
+>   --sr         $(SR) \
+>   --verify-only
+> touch "$@"
 
 $(MIX_VAL_STAMP): $(LIBRISPEECH_STAMP) $(DEMAND_STAMP) $(LISTS_STAMP)
 > @echo "[mix] val → $(MIX_VAL_DIR)"
@@ -287,14 +291,14 @@ $(MIX_VAL_STAMP): $(LIBRISPEECH_STAMP) $(DEMAND_STAMP) $(LISTS_STAMP)
 >   --segment-min $(SEG_MIN) \
 >   --segment-max $(SEG_MAX)
 > $(ACTIVATE) && python "$(MIXGEN)" \
-  --clean-list "$(CLEAN_LIST)" \
-  --noise-list "$(NOISE_LIST)" \
-  --rir-list   "$(RIRS_LIST)" \
-  --out-dir    "$(MIX_VAL_DIR)" \
-  --snr        $(SNR) \
-  --sr         $(SR) \
-  --verify-only
-> touch $@
+>   --clean-list "$(CLEAN_LIST)" \
+>   --noise-list "$(NOISE_LIST)" \
+>   --rir-list   "$(RIRS_LIST)" \
+>   --out-dir    "$(MIX_VAL_DIR)" \
+>   --snr        $(SNR) \
+>   --sr         $(SR) \
+>   --verify-only
+> touch "$@"
 
 # ---------- Datasets Orchestration ----------
 datasets: deps-audio noise.ensure noise.verify $(MIX_TRAIN_STAMP) $(MIX_VAL_STAMP)
@@ -303,14 +307,14 @@ datasets: deps-audio noise.ensure noise.verify $(MIX_TRAIN_STAMP) $(MIX_VAL_STAM
 datasets.verify: deps-audio
 > set -e
 > $(ACTIVATE) && python "$(MIXGEN)" \
-  --clean-list "$(CLEAN_LIST)" \
-  --noise-list "$(NOISE_LIST)" \
-  --rir-list   "$(RIRS_LIST)" \
-  --out-dir    "$(MIX_TRAIN_DIR)" \
-  --snr        $(SNR) \
-  --sr         $(SR) \
-  --verify-only
-> $(ACTIVATE) && python "$(MIXGEN)" --out-dir "$(MIX_VAL_DIR)"   --sr $(SR) --verify-only
+>   --clean-list "$(CLEAN_LIST)" \
+>   --noise-list "$(NOISE_LIST)" \
+>   --rir-list   "$(RIRS_LIST)" \
+>   --out-dir    "$(MIX_TRAIN_DIR)" \
+>   --snr        $(SNR) \
+>   --sr         $(SR) \
+>   --verify-only
+> $(ACTIVATE) && python "$(MIXGEN)" --out-dir "$(MIX_VAL_DIR)" --sr $(SR) --verify-only
 > @echo "[datasets.verify] OK"
 
 datasets.clean:
@@ -319,7 +323,7 @@ datasets.clean:
 # ---------- Unified dataset (AGGREGATOR only) ----------
 dataset-unified:
 > test -f "$(UNIFIED_SCRIPT)" || { echo "[ERR] $(UNIFIED_SCRIPT) missing. Add it, apoi rulează din nou."; exit 2; }
-> $(ACTIVATE) && python "$(UNIFIED_SCRIPT)"
+> $(ACTIVATE) && PYTHONPATH="$(PYTHONPATH)" python "$(UNIFIED_SCRIPT)"
 
 dataset-unified.clean:
 > rm -rf "$(DATA_FINAL_DIR)"
@@ -327,22 +331,31 @@ dataset-unified.clean:
 # ---------- Train ----------
 train:
 > mkdir -p artifacts/logs
-> $(ACTIVATE) && MODEL_MODULE="$(MODEL_MODULE)" \
-> python -m se_cli.cli train --config $(CFG_TRAIN) 2>&1 | tee artifacts/logs/train_$$.log
+> LOG="artifacts/logs/train_$$(date +%Y%m%d-%H%M%S).log"; \
+> $(ACTIVATE) && PYTHONPATH="$(PYTHONPATH)" MODEL_MODULE="$(MODEL_MODULE)" \
+> python -m se_cli.cli train --config "$(CFG_TRAIN)" 2>&1 | tee "$$LOG"; \
+> echo "[train] log: $$LOG"
 
 # ---------- TensorBoard & logs ----------
 tb:
 > $(ACTIVATE) && tensorboard --logdir artifacts/exp --port 6006
 
 logs:
-> tail -f artifacts/logs/*.log
+> if ls artifacts/logs/*.log >/dev/null 2&>1; then \
+>   LAST=$$(ls -1t artifacts/logs/*.log | head -n1); \
+>   echo "[logs] tail -f $$LAST"; \
+>   tail -f "$$LAST"; \
+> else \
+>   echo "[logs] no logs found in artifacts/logs"; \
+> fi
 
 # ---------- Export ----------
 export:
-> $(ACTIVATE) && python deploy/export_onnx_min.py \
->   --model $(MODEL_MODULE):build_model \
->   --config $(CFG_TRAIN) \
->   --out $(ONNX_PATH) \
+> mkdir -p "$$(dirname "$(ONNX_PATH)")"
+> $(ACTIVATE) && PYTHONPATH="$(PYTHONPATH)" python deploy/export_onnx_min.py \
+>   --model "$(MODEL_MODULE):build_model" \
+>   --config "$(CFG_TRAIN)" \
+>   --out "$(ONNX_PATH)" \
 >   --opset 17 --dynamic 0 \
 >   --input-name noisy \
 >   --keep-ch 1
@@ -351,25 +364,29 @@ export:
 onnx: onnx-verify
 
 onnx-verify:
-> $(ACTIVATE) && python deploy/verify_onnx.py $(ONNX_PATH) --config $(CFG_TRAIN)
+> $(ACTIVATE) && PYTHONPATH="$(PYTHONPATH)" python deploy/verify_onnx.py "$(ONNX_PATH)" --config "$(CFG_TRAIN)"
 
 onnx-verify-sim:
-> $(ACTIVATE) && python deploy/verify_onnx.py $(ONNX_PATH:.onnx=.sim.onnx) --config $(CFG_TRAIN)
+> $(ACTIVATE) && PYTHONPATH="$(PYTHONPATH)" python deploy/verify_onnx.py "$(ONNX_PATH:.onnx=.sim.onnx)" --config "$(CFG_TRAIN)"
 
 onnx-sanity:
-> $(ACTIVATE) && python deploy/sanity_onnx.py $(ONNX_PATH)
+> $(ACTIVATE) && PYTHONPATH="$(PYTHONPATH)" python deploy/sanity_onnx.py "$(ONNX_PATH)"
 
-# ---------- Hooks opționale ----------
-infer:
-> $(ACTIVATE) && python -m se_cli.cli infer --config $(CFG_TRAIN)
+# ---------- Inference / Eval ----------
+enhance:
+> $(ACTIVATE) && PYTHONPATH="$(PYTHONPATH)" python -m se_cli.cli enhance --config "$(CFG_TRAIN)"
+
+# Alias „infer” → subcomanda „enhance” a CLI-ului
+infer: enhance
 
 eval:
-> $(ACTIVATE) && python -m se_cli.cli eval --config $(CFG_TRAIN)
+> $(ACTIVATE) && PYTHONPATH="$(PYTHONPATH)" python -m se_cli.cli eval --config "$(CFG_TRAIN)"
 
 # ---------- Utils ----------
 print-vars:
 > @echo "PWD               : $(PWD)"
 > @echo "VENV              : $(VENV)"
+> @echo "PYTHONPATH        : $(PYTHONPATH)"
 > @echo "MODEL_MODULE      : $(MODEL_MODULE)"
 > @echo "CFG_TRAIN         : $(CFG_TRAIN)"
 > @echo "ONNX_PATH         : $(ONNX_PATH)"
@@ -385,10 +402,10 @@ print-vars:
 > @echo "MIX_VAL_DIR       : $(MIX_VAL_DIR)"
 
 check-scripts:
-> test -f scripts/build_vbd_pairs.sh || { echo "[ERR] scripts/build_vbd_pairs.sh missing"; exit 2; }
+> test -f scripts/build_vbd_pairs.sh   || { echo "[ERR] scripts/build_vbd_pairs.sh missing"; exit 2; }
 > test -f scripts/verify_and_prepare.sh || { echo "[ERR] scripts/verify_and_prepare.sh missing"; exit 2; }
-> test -f scripts/ensure_noise.sh    || { echo "[ERR] scripts/ensure_noise.sh missing"; exit 2; }
-> test -f scripts/verify_noise.py    || { echo "[ERR] scripts/verify_noise.py missing"; exit 2; }
+> test -f scripts/ensure_noise.sh      || { echo "[ERR] scripts/ensure_noise.sh missing"; exit 2; }
+> test -f scripts/verify_noise.py      || { echo "[ERR] scripts/verify_noise.py missing"; exit 2; }
 > true
 
 # ---------- Cleanup ----------

@@ -1,14 +1,15 @@
+# configs/exp_mamba_unet.yaml
 experiment:
   name: mamba_unet_v0
   out_dir: artifacts/exp
 
 data:
   sample_rate: 16000
-  train_manifest: data/prepared/train_mixes/manifests/pairs.csv
-  val_manifest:   data/prepared/dev_mixes/manifests/pairs.csv
+  train_manifest: data/prepared/mix/train/manifests/pairs.csv
+  val_manifest:   data/prepared/mix/val/manifests/pairs.csv
 
 model:
-  module: se_models.mamba_unet.model   # <<— importă direct modulul dorit
+  module: se_models.mamba_unet.model    # importă direct modulul dorit
   name: mamba_unet
   in_ch: 1
   base: 32
@@ -19,6 +20,17 @@ train:
   lr: 2.0e-4
   segment_sec: 4.0
   seed: 1337
+  num_workers: 4
+
+  # ===== Mixed Precision (doar pe CUDA) =====
+  amp: true
+  grad_clip: 5.0
+
+  # ===== Ponderi pierderi =====
+  w_time: 0.2
+  w_mag:  0.6
+  w_sc:   0.2
+  w_sisdr: 1.0
 
   # ===== Adaptive LR (ReduceLROnPlateau pe val_loss) =====
   scheduler:
@@ -27,7 +39,12 @@ train:
     patience: 5       # așteaptă 5 epoci fără îmbunătățire
     min_lr: 1.0e-6
     cooldown: 0
-    verbose: true
+    # verbose: true    # <- eliminat pt. compat cu versiuni PyTorch care nu au param.
+
+  # (opționale; suportate dacă versiunea ta de PyTorch le are)
+  #   threshold: 1.0e-4
+  #   threshold_mode: rel
+  #   eps: 1.0e-8
 
   # ===== Early Stopping (bazat pe val_loss) =====
   early_stopping:
