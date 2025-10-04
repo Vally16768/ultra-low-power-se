@@ -13,21 +13,21 @@ Trainer pentru Ultra-Low-Power SE.
 """
 
 from __future__ import annotations
-import os
 import csv
-import json
-import time
-import random
 import inspect
+import json
+import os
+import random
+import time
 from pathlib import Path
-from typing import Dict, Any, Tuple, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -37,8 +37,26 @@ def _set_seed(s: int):
     random.seed(s)
     np.random.seed(s)
     torch.manual_seed(s)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
+    torch.cuda.manual_seed_all(s)
+    # determinism (ok pentru training stabil, chiar dacă poate reduce puțin viteza)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    if sr_in == sr_out:
+        return x
+    try:
+        import resampy  # preferat, rapid
+        return resampy.resample(x, sr_in, sr_out)
+    except Exception:
+        try:
+            import librosa
+            return librosa.resample(x, sr_in, sr_out, res_type="kaiser_best")
+        except Exception as e:
+            raise RuntimeError(
+                f"Nu pot face resampling {sr_in}->{sr_out}. Instalează 'resampy' sau 'librosa'. Eroare: {e}"
+            )
 
 
 def _load_wav_mono16k(path: str | Path, target_sr: int = 16000) -> np.ndarray:
@@ -46,8 +64,7 @@ def _load_wav_mono16k(path: str | Path, target_sr: int = 16000) -> np.ndarray:
     if x.ndim > 1:
         x = x.mean(-1)
     if sr != target_sr:
-        import resampy  # lazy import
-        x = resampy.resample(x, sr, target_sr)
+        x = _resample(x, sr, target_sr)
     return x
 
 
@@ -56,28 +73,37 @@ def _si_sdr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torc
     if pred.dim() == 1:
         pred = pred.unsqueeze(0)
         target = target.unsqueeze(0)
-    s_target = (torch.sum(pred * target, dim=-1, keepdim=True)
-                / (torch.sum(target ** 2, dim=-1, keepdim=True) + eps)) * target
-    e_noise = pred - s_target
+    # zero-mean
+    pred_zm = pred - pred.mean(dim=-1, keepdim=True)
+    targ_zm = target - target.mean(dim=-1, keepdim=True)
+    # proiecție
+    s_target = (torch.sum(pred_zm * targ_zm, dim=-1, keepdim=True) /
+                (torch.sum(targ_zm ** 2, dim=-1, keepdim=True) + eps)) * targ_zm
+    e_noise = pred_zm - s_target
     num = torch.sum(s_target ** 2, dim=-1)
     den = torch.sum(e_noise ** 2, dim=-1) + eps
-    return 10.0 * torch.log10(num / den + eps)
+    return 10.0 * torch.log10((num + eps) / den)
 
 
 def _stft_mag(x: torch.Tensor, n_fft: int, hop: int, win: int) -> torch.Tensor:
     """x: [B,T] -> |STFT|: [B, F, T'] """
     window = torch.hann_window(win, device=x.device)
-    X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win,
-                   window=window, return_complex=True, center=True)
+    X = torch.stft(
+        x, n_fft=n_fft, hop_length=hop, win_length=win,
+        window=window, return_complex=True, center=True
+    )
     return torch.abs(X)
 
 
-def _mrstft_loss(pred: torch.Tensor, target: torch.Tensor,
-                 cfg: Tuple[Tuple[int, int, int], ...] = (
-                     (256, 64, 256),
-                     (512, 128, 512),
-                     (1024, 256, 1024),
-                 )) -> Tuple[torch.Tensor, torch.Tensor]:
+def _mrstft_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    cfg: Tuple[Tuple[int, int, int], ...] = (
+        (256, 64, 256),
+        (512, 128, 512),
+        (1024, 256, 1024),
+    ),
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Multi-Resolution STFT loss:
       - mag_l1: L1 pe magnitudini
@@ -91,13 +117,13 @@ def _mrstft_loss(pred: torch.Tensor, target: torch.Tensor,
 
         mag_l1 += (Mp - Mt).abs().mean()
 
-        num = torch.linalg.norm(Mp - Mt, ord='fro', dim=(-2, -1))  # [B]
-        den = torch.linalg.norm(Mt,      ord='fro', dim=(-2, -1))  # [B]
+        # Frobenius pe ultimele două axe
+        num = torch.linalg.norm(Mp - Mt, ord="fro", dim=(-2, -1))  # [B]
+        den = torch.linalg.norm(Mt,      ord="fro", dim=(-2, -1))  # [B]
         sc  += (num / (den + 1e-8)).mean()
 
-    mag_l1 /= len(cfg)
-    sc     /= len(cfg)
-    return mag_l1, sc
+    n = float(len(cfg))
+    return mag_l1 / n, sc / n
 
 
 # ------------------ Dataset ------------------
@@ -134,7 +160,9 @@ class _PairsDataset(Dataset):
             return self._cache[p]
         x = _load_wav_mono16k(p, self.sr)
         self._cache[p] = x
-        if len(self._cache) > 256:  # bound cache
+        # mic LRU - evităm creșterea nelimitată
+        if len(self._cache) > 256:
+            # pop primul key inserat
             self._cache.pop(next(iter(self._cache)))
         return x
 
@@ -222,7 +250,7 @@ def _get_model_from_repo(cfg: Dict[str, Any]) -> nn.Module:
         if hasattr(user_model, "TinyMambaUNetStub"):
             return user_model.TinyMambaUNetStub()
 
-    # Fallback U-Net 1D mic
+    # Fallback U-Net 1D mic (stabil, ONNX-friendly)
     class _ConvBlock(nn.Module):
         def __init__(self, ch_in, ch_out, k=9, d=1):
             super().__init__()
@@ -264,6 +292,7 @@ def _get_model_from_repo(cfg: Dict[str, Any]) -> nn.Module:
             d1 = self.up1(d2)
             d1 = self.dec1(torch.cat([d1, e1], dim=1))
             y = self.out(d1)
+            # reziduu pentru stabilitate
             return torch.tanh(y + x)
 
     return _SmallUNet1D()
@@ -286,23 +315,30 @@ def _safe_build_plateau(optimizer, **kwargs):
 
 
 # ------------------ Antrenare / Validare ------------------
-def _run_epoch(model: nn.Module, loader: DataLoader, optimizer, scaler,
-               device: torch.device, train: bool, loss_cfg: Dict[str, float]) -> Tuple[float, float]:
+def _run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer,
+    scaler,
+    device: torch.device,
+    train: bool,
+    loss_cfg: Dict[str, float],
+) -> Tuple[float, float]:
     model.train(train)
     tot_loss = 0.0
     tot_sisdr = 0.0
     n_frames = 0
 
     bar = tqdm(loader, desc="train" if train else "valid", leave=False)
-    use_amp = bool(loss_cfg.get("amp", False)) and device.type == "cuda"
-    amp_dtype = torch.float16 if device.type == "cuda" else torch.bfloat16
+    use_amp = bool(loss_cfg.get("amp", 0.0)) and device.type == "cuda"
+    amp_dtype = torch.float16  # pe CUDA folosim fp16; pe CPU nu activăm AMP
 
     for noisy, clean, lengths in bar:
         noisy = noisy.to(device)   # [B,1,T]
         clean = clean.to(device)   # [B,1,T]
 
         with torch.set_grad_enabled(train):
-            with torch.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
+            with torch.autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
                 pred = model(noisy).squeeze(1)   # [B,T]
                 clean_mono = clean.squeeze(1)    # [B,T]
 
@@ -320,12 +356,12 @@ def _run_epoch(model: nn.Module, loader: DataLoader, optimizer, scaler,
                 optimizer.zero_grad(set_to_none=True)
                 if scaler is not None and use_amp:
                     scaler.scale(loss).backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), loss_cfg["grad_clip"])
+                    nn.utils.clip_grad_norm_(model.parameters(), float(loss_cfg["grad_clip"]))
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), loss_cfg["grad_clip"])
+                    nn.utils.clip_grad_norm_(model.parameters(), float(loss_cfg["grad_clip"]))
                     optimizer.step()
 
         B = noisy.shape[0]
@@ -333,8 +369,10 @@ def _run_epoch(model: nn.Module, loader: DataLoader, optimizer, scaler,
         tot_sisdr += float(sisdr.detach()) * B
         n_frames += B
 
-        bar.set_postfix(loss=f"{(tot_loss/max(1,n_frames)):.4f}",
-                        sdr=f"{(tot_sisdr/max(1,n_frames)):.2f} dB")
+        bar.set_postfix(
+            loss=f"{(tot_loss/max(1,n_frames)):.4f}",
+            sdr=f"{(tot_sisdr/max(1,n_frames)):.2f} dB"
+        )
 
     return tot_loss / max(1, n_frames), tot_sisdr / max(1, n_frames)
 
@@ -363,18 +401,18 @@ def main(cfg: Dict[str, Any]):
         "patience":  int(sched_cfg.get("patience", 5)),
         "cooldown":  int(sched_cfg.get("cooldown", 0)),
         "min_lr":    float(sched_cfg.get("min_lr", 1e-6)),
-        # 'verbose' poate lipsi în unele versiuni de PyTorch → filtrăm în _safe_build_plateau
+        # 'verbose' vs. versiuni diferite → filtrăm în _safe_build_plateau
         "verbose":   bool(sched_cfg.get("verbose", False)),
-        # threshold/threshold_mode pot exista în unele configuri; suportăm dacă le are versiunea
+        # threshold/threshold_mode/eps — dacă nu sunt acceptate de versiunea ta, vor fi ignorate
         "threshold": float(sched_cfg.get("threshold", 1e-4)),
         "threshold_mode": str(sched_cfg.get("threshold_mode", "rel")),
         "eps": float(sched_cfg.get("eps", 1e-8)),
     }
 
     # early stopping
-    es_cfg      = (train_cfg.get("early_stopping") or {})
-    es_patience = int(es_cfg.get("patience", 10))
-    es_min_delta= float(es_cfg.get("min_delta", 0.0))
+    es_cfg       = (train_cfg.get("early_stopping") or {})
+    es_patience  = int(es_cfg.get("patience", 10))
+    es_min_delta = float(es_cfg.get("min_delta", 0.0))
 
     out_root = Path(exp_cfg.get("out_dir", "artifacts/exp"))
     exp_name = exp_cfg.get("name", "se_experiment")
@@ -424,45 +462,53 @@ def main(cfg: Dict[str, Any]):
     best_path = None
     epochs_no_improve = 0
 
-    for ep in range(1, epochs + 1):
-        t0 = time.time()
-        tr_loss, tr_sdr = _run_epoch(model, train_ld, optimizer, scaler, device, train=True,  loss_cfg=loss_cfg)
-        va_loss, va_sdr = _run_epoch(model, val_ld,   optimizer, scaler, device, train=False, loss_cfg=loss_cfg)
-        dt = time.time() - t0
+    try:
+        for ep in range(1, epochs + 1):
+            t0 = time.time()
+            tr_loss, tr_sdr = _run_epoch(model, train_ld, optimizer, scaler, device, train=True,  loss_cfg=loss_cfg)
+            va_loss, va_sdr = _run_epoch(model, val_ld,   optimizer, scaler, device, train=False, loss_cfg=loss_cfg)
+            dt = time.time() - t0
 
-        # logs
-        writer.add_scalar("loss/train", tr_loss, ep)
-        writer.add_scalar("loss/val",   va_loss, ep)
-        writer.add_scalar("sisdr/train", tr_sdr, ep)
-        writer.add_scalar("sisdr/val",   va_sdr, ep)
-        writer.add_scalar("lr", optimizer.param_groups[0]["lr"], ep)
+            # logs
+            writer.add_scalar("loss/train", tr_loss, ep)
+            writer.add_scalar("loss/val",   va_loss, ep)
+            writer.add_scalar("sisdr/train", tr_sdr, ep)
+            writer.add_scalar("sisdr/val",   va_sdr, ep)
+            writer.add_scalar("lr", optimizer.param_groups[0]["lr"], ep)
 
-        print(f"[ep {ep:03d}] "
-              f"train_loss={tr_loss:.4f} val_loss={va_loss:.4f} | "
-              f"SI-SDR tr={tr_sdr:.2f} val={va_sdr:.2f} | "
-              f"lr={optimizer.param_groups[0]['lr']:.2e} | {dt:.1f}s")
+            print(f"[ep {ep:03d}] "
+                  f"train_loss={tr_loss:.4f} val_loss={va_loss:.4f} | "
+                  f"SI-SDR tr={tr_sdr:.2f} val={va_sdr:.2f} | "
+                  f"lr={optimizer.param_groups[0]['lr']:.2e} | {dt:.1f}s")
 
-        # adaptive LR (monitor val_loss)
-        scheduler.step(va_loss)
+            # adaptive LR (monitor val_loss)
+            scheduler.step(va_loss)
 
-        # checkpoint last
-        last_path = outdir / "last.ckpt"
-        torch.save({"model": model.state_dict(), "ep": ep, "val_loss": va_loss}, last_path)
+            # checkpoint last (compatibilitate: salvăm și 'model', și 'state_dict')
+            last_path = outdir / "last.ckpt"
+            state_dict = model.state_dict()
+            torch.save({"state_dict": state_dict, "model": state_dict, "ep": ep, "val_loss": va_loss}, last_path)
 
-        # checkpoint best + early stopping book-keeping
-        if va_loss < (best_val - es_min_delta):
-            best_val = va_loss
-            best_path = outdir / "best.ckpt"
-            torch.save({"model": model.state_dict(), "ep": ep, "val_loss": va_loss}, best_path)
-            epochs_no_improve = 0
-            print(f"  ↳ new best: {best_val:.4f} → {best_path}")
-        else:
-            epochs_no_improve += 1
-            print(f"  ↳ no improvement ({epochs_no_improve}/{es_patience})")
+            # checkpoint best + early stopping book-keeping
+            if va_loss < (best_val - es_min_delta):
+                best_val = va_loss
+                best_path = outdir / "best.ckpt"
+                torch.save({"state_dict": state_dict, "model": state_dict, "ep": ep, "val_loss": va_loss}, best_path)
+                epochs_no_improve = 0
+                print(f"  ↳ new best: {best_val:.4f} → {best_path}")
+            else:
+                epochs_no_improve += 1
+                print(f"  ↳ no improvement ({epochs_no_improve}/{es_patience})")
 
-        # early stopping
-        if epochs_no_improve >= es_patience:
-            print(f"[early-stopping] No improvement ≥ {es_min_delta} for {es_patience} epochs. Stop.")
-            break
+            # early stopping
+            if epochs_no_improve >= es_patience:
+                print(f"[early-stopping] No improvement ≥ {es_min_delta} for {es_patience} epochs. Stop.")
+                break
+    finally:
+        try:
+            writer.flush()
+            writer.close()
+        except Exception:
+            pass
 
     print(f"Done. Best val_loss={best_val:.4f} at {best_path}")

@@ -6,8 +6,7 @@ experiment:
 model:
   base_channels: 32
   depth: 3
-export:
-  sample_len: 16000
+  causal: true     # pentru streaming/edge
 
 data:
   sample_rate: 16000

@@ -50,6 +50,21 @@ enhance: $(VENV)/bin/activate
 > test -n "$(IN_WAV)" || (echo "Setează IN_WAV=path.wav"; exit 1)
 > $(ACTIVATE); python -m se_cli.cli enhance --config $(CFG) -o inference.in_wav=$(IN_WAV)
 
+.PHONY: parity
+parity: $(VENV)/bin/activate export
+> $(ACTIVATE); python tools/parity_onnx.py \
+>   --model se_models.mamba_unet.model:build_model \
+>   --config $(CFG) \
+>   --onnx artifacts/export/mamba_unet_auto.onnx \
+>   --T 24000 --tol 0.01
+
+.PHONY: quantize
+quantize: $(VENV)/bin/activate export
+> $(ACTIVATE); python deploy/quantize_onnx.py \
+>   --in_model artifacts/export/mamba_unet_auto.onnx \
+>   --out_model artifacts/export/mamba_unet_auto.int8.onnx \
+>   --weight_type QInt8
+
 # ---------- Export ONNX ----------
 .PHONY: export
 export: $(VENV)/bin/activate
@@ -79,3 +94,16 @@ clean:
 .PHONY: distclean
 distclean: clean
 > rm -rf $(VENV)
+
+
+.PHONY: lint type test
+lint: $(VENV)/bin/activate
+> $(ACTIVATE); ruff check .
+
+type: $(VENV)/bin/activate
+> $(ACTIVATE); mypy .
+
+test: $(VENV)/bin/activate
+> $(ACTIVATE); pytest -q
+
+# deja ai export/onnx-sanity; mai sus ai și parity/quantize
