@@ -3,26 +3,34 @@
     "name": "mamba_unet_v0",
     "out_dir": "artifacts/exp"
   },
-  "data": {
-    "sample_rate": 16000,
-    "train_manifest": "data/prepared/mix/train/manifests/pairs.csv",
-    "val_manifest": "data/prepared/mix/val/manifests/pairs.csv"
-  },
   "model": {
     "module": "se_models.mamba_unet.model",
     "name": "mamba_unet",
     "in_ch": 1,
-    "base": 32
+    "base_channels": 32,
+    "depth": 3,
+    "causal": true,
+    "checkpoint": "artifacts/exp/mamba_unet_v0/checkpoints/best.ckpt"
+  },
+  "data": {
+    "sample_rate": 16000,
+    "train_manifest": "data/prepared/mix/train/manifests/pairs.csv",
+    "val_manifest": "data/prepared/mix/val/manifests/pairs.csv",
+    "manifests": {
+      "test_offline": "data/prepared/voicebank/test/manifests/pairs.csv",
+      "test_streaming": "data/prepared/test_challenge/streaming/manifests/pairs.csv"
+    }
   },
   "train": {
-    "epochs": 50,
-    "batch_size": 8,
+    "epochs": 1,
+    "batch_size": 2,
     "lr": 0.0002,
     "segment_sec": 4.0,
     "seed": 1337,
     "num_workers": 4,
     "amp": true,
     "grad_clip": 5.0,
+    "grad_accum_steps": 1,
     "w_time": 0.2,
     "w_mag": 0.6,
     "w_sc": 0.2,
@@ -32,11 +40,43 @@
       "factor": 0.5,
       "patience": 5,
       "min_lr": 1e-06,
-      "cooldown": 0
+      "cooldown": 0,
+      "threshold": 0.0001,
+      "threshold_mode": "rel",
+      "eps": 1e-08
     },
     "early_stopping": {
       "patience": 10,
       "min_delta": 0.0
     }
+  },
+  "eval": {
+    "sr": 16000,
+    "metrics": [
+      "pesq",
+      "stoi",
+      "si_sdr",
+      "seg_snr"
+    ],
+    "offline": {
+      "manifest": "data/prepared/voicebank/test/manifests/pairs.csv",
+      "outdir": "artifacts/eval/mamba_unet/enhanced"
+    },
+    "streaming": {
+      "enabled": false,
+      "manifest": "data/prepared/test_challenge/streaming/manifests/pairs.csv",
+      "window": 20480,
+      "hop": 10240
+    }
+  },
+  "inference": {
+    "out_wav": "artifacts/demo_out.wav",
+    "seconds": 1
+  },
+  "export": {
+    "sample_len": 16000,
+    "opset": 17,
+    "dynamic_axes": true,
+    "quantize_dynamic": false
   }
 }
