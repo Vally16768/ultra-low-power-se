@@ -349,7 +349,7 @@ def _run_epoch(
         tot_sisdr += float(sisdr.detach()) * B
         n_frames += B
 
-        bar.set_postfix(loss=f"{(tot_loss/max(1,n_frames)):.4f}", sdr=f"{(tot_sisdr/max(1,n_frames)):.2f} dB")
+        bar.set_postfix(loss=f"{(tot_loss / max(1, n_frames)):.4f}", sdr=f"{(tot_sisdr / max(1, n_frames)):.2f} dB")
 
     return tot_loss / max(1, n_frames), tot_sisdr / max(1, n_frames)
 
@@ -406,7 +406,7 @@ def main(cfg: Dict[str, Any]):
     # ---- model & loaders ----
     model = _get_model_from_repo(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[model] total params: {n_params/1e6:.2f}M")
+    print(f"[model] total params: {n_params / 1e6:.2f}M")
 
     # warm-start / resume
     ckpt_path = (cfg.get("model", {}) or {}).get("checkpoint", "")

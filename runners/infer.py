@@ -178,7 +178,7 @@ def _prepare_model(C: Cfg, cfg: Dict[str, Any]) -> tuple[nn.Module, torch.device
     build_fn = _resolve_build_fn(C.model_module)
     model: nn.Module = build_fn(cfg) if build_fn.__code__.co_argcount else build_fn()
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[model] total params: {n_params/1e6:.2f}M")
+    print(f"[model] total params: {n_params / 1e6:.2f}M")
 
     if not C.checkpoint.exists():
         raise SystemExit(f"Checkpoint inexistent: {C.checkpoint}")

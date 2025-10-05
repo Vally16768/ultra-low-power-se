@@ -21,16 +21,18 @@
   "model": {
     "module": "se_models.lstm_baseline.model:build_model",
     "args": {
-      "sample_rate": 16000,
       "hidden": 256,
       "num_layers": 2,
       "bidirectional": true,
       "frame_ms": 20,
-      "lookahead_ms": 0
+      "lookahead_ms": 0,
+      "channels": 64,
+      "residual": true
     }
   },
   "train": {
-    "batch_size": 8,
+    "batch_size": 2,
+    "accum_steps": 4,
     "epochs": 80,
     "optimizer": "adam",
     "lr": 0.002,
@@ -82,7 +84,9 @@
   },
   "export": {
     "onnx": {
-      "dynamic_axes": true
+      "dynamic_axes": true,
+      "opset": 17,
+      "out": "artifacts/export/lstm_edge_s.onnx"
     }
   }
 }

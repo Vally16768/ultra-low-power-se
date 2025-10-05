@@ -154,7 +154,7 @@ def main():
 
     scope = tuple([s.strip() for s in args.scope.split(",") if s.strip()])
     nmods = l2_structured_prune(model, pct=args.pct, scope=scope)
-    print(f"[prune] factory={factory_name}  modules_pruned={nmods}  amount={args.pct*100:.0f}%  scope={scope}")
+    print(f"[prune] factory={factory_name}  modules_pruned={nmods}  amount={args.pct * 100:.0f}%  scope={scope}")
 
     model = finetune_short(model, epochs=args.epochs)
 

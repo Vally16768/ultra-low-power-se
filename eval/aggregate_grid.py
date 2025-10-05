@@ -27,13 +27,13 @@ def main():
                 "variant": Path(jf).stem.replace("_metrics", ""),
                 "model_path": model_path,
                 "size_mb": f"{size_mb:.2f}",
-                "pesq_mean": f"{met.get('pesq',{}).get('mean','')}",
-                "stoi_mean": f"{met.get('stoi',{}).get('mean','')}",
-                "snr_impr_mean": f"{met.get('snr',{}).get('mean','')}",
-                "lat_mean_ms": f"{lat.get('mean','')}",
-                "lat_p50_ms": f"{lat.get('p50','')}",
-                "lat_p90_ms": f"{lat.get('p90','')}",
-                "lat_p99_ms": f"{lat.get('p99','')}",
+                "pesq_mean": f"{met.get('pesq', {}).get('mean', '')}",
+                "stoi_mean": f"{met.get('stoi', {}).get('mean', '')}",
+                "snr_impr_mean": f"{met.get('snr', {}).get('mean', '')}",
+                "lat_mean_ms": f"{lat.get('mean', '')}",
+                "lat_p50_ms": f"{lat.get('p50', '')}",
+                "lat_p90_ms": f"{lat.get('p90', '')}",
+                "lat_p99_ms": f"{lat.get('p99', '')}",
             }
         )
 

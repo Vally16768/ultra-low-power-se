@@ -1,71 +1,122 @@
-# se_models/lstm_baseline/model.py
+from __future__ import annotations
+from types import SimpleNamespace
+from typing import Any, Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ---------- utils ----------
+def _is_mapping(x) -> bool:
+    return isinstance(x, dict | SimpleNamespace)
+
+
+def _get(obj, key: str, default=None):
+    parts = key.split(".")
+    cur = obj
+    for p in parts:
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        elif isinstance(cur, SimpleNamespace) and hasattr(cur, p):
+            cur = getattr(cur, p)
+        else:
+            return default
+    return cur
+
+
+def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(a)
+    out.update({k: v for k, v in b.items() if v is not None})
+    return out
+
+
+# ---------- model ----------
 class LSTMEnhancer(nn.Module):
     """
-    Input:  x [B, 1, T]  (16 kHz)
-    Output: y [B, 1, T]
+    Ultra-light waveform denoiser:
+      [B,1,T] -> Conv1d stack -> (Bi)LSTM pe [B,T,C] -> 1x1 -> Tanh -> (rezidual)
+      I/O: [B,1,T] -> [B,1,T]
     """
 
-    def __init__(self, hidden=256, num_layers=2, bidirectional=True, frame_ms=20, lookahead_ms=0, sample_rate=16000):
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 16000,
+        hidden: int = 256,
+        num_layers: int = 2,
+        bidirectional: bool = True,
+        frame_ms: int = 20,
+        lookahead_ms: int = 0,
+        channels: int = 64,
+        residual: bool = True,
+    ):
         super().__init__()
-        self.sample_rate = sample_rate
-        self.frame = int(frame_ms * sample_rate // 1000)  # ex. 320
-        self.hop = self.frame // 2  # ex. 160
-        self.pad = self.frame // 2
+        self.sample_rate = int(sample_rate)
+        self.frame_ms = int(frame_ms)
+        self.lookahead_ms = int(lookahead_ms)
+        self.residual = bool(residual)
 
-        # Feature encoder (causal-friendly 1D conv)
+        c = int(channels)
         self.enc = nn.Sequential(
-            nn.Conv1d(1, 32, kernel_size=9, stride=1, padding=4),
+            nn.Conv1d(1, c // 2, kernel_size=7, stride=1, padding=3),
             nn.PReLU(),
-            nn.Conv1d(32, 64, kernel_size=9, stride=2, padding=4),  # down x2
+            nn.Conv1d(c // 2, c, kernel_size=7, stride=1, padding=3),
+            nn.PReLU(),
+            nn.Conv1d(c, c, kernel_size=7, stride=1, padding=3),
             nn.PReLU(),
         )
 
-        rnn_in = 64
-        self.bi = bidirectional
+        self.bi = bool(bidirectional)
         self.rnn = nn.LSTM(
-            input_size=rnn_in,
-            hidden_size=hidden,
-            num_layers=num_layers,
+            input_size=c,
+            hidden_size=int(hidden),
+            num_layers=int(num_layers),
             batch_first=True,
-            bidirectional=bidirectional,
+            bidirectional=self.bi,
         )
-        rnn_out = hidden * (2 if bidirectional else 1)
+        rnn_out = int(hidden) * (2 if self.bi else 1)
+        self.proj = nn.Conv1d(rnn_out, 1, kernel_size=1)
+        self.act = nn.Tanh()
 
-        # Decoder back to waveform domain
-        self.dec = nn.Sequential(
-            nn.ConvTranspose1d(rnn_out, 32, kernel_size=4, stride=2, padding=1),  # up x2
-            nn.PReLU(),
-            nn.Conv1d(32, 1, kernel_size=9, stride=1, padding=4),
-            nn.Tanh(),  # mask-ish output in [-1,1]
-        )
-
-    def _framing(self, x):
-        # x: [B, 1, T] -> frames [B, C, T'] then permute to [B, T', C]
-        # Folosim pur și simplu conv stridat pentru a obține un "T'" temporar.
-        return self.enc(x)  # [B, 64, T']
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T = x.shape
-        h = self._framing(x)  # [B, 64, T']
-        h_t = h.transpose(1, 2)  # [B, T', 64] pentru LSTM
-        h_t, _ = self.rnn(h_t)  # [B, T', H]
-        h = h_t.transpose(1, 2)  # [B, H, T']
-        y = self.dec(h)  # [B, 1, T] (după upsample)
-        # aliniază exact la T (în caz de off-by-one datorat padding/stride)
-        if y.size(-1) != T:
-            if y.size(-1) > T:
-                y = y[..., :T]
-            else:
-                y = F.pad(y, (0, T - y.size(-1)))
-        return y
+        h = self.enc(x)  # [B, Cenc, T]
+        h_t, _ = self.rnn(h.transpose(1, 2))  # [B, T, Hrnn]
+        y_hat = self.act(self.proj(h_t.transpose(1, 2)))  # [B,1,T]
+        out = x + y_hat if self.residual else y_hat
+        if out.size(-1) != T:  # safety align
+            out = out[..., :T] if out.size(-1) > T else F.pad(out, (0, T - out.size(-1)))
+        return out
 
 
-def build_model(sample_rate=16000, hidden=256, num_layers=2, bidirectional=True, frame_ms=20, lookahead_ms=0, **kwargs):
-    return LSTMEnhancer(
-        hidden=hidden, num_layers=num_layers, bidirectional=bidirectional, frame_ms=frame_ms, lookahead_ms=lookahead_ms, sample_rate=sample_rate
+# ---------- builder ----------
+def build_model(cfg: Any = None, **overrides) -> nn.Module:
+    """
+    Acceptă:
+      * build_model(cfg) -> citește cfg.model.args + data.sample_rate
+      * build_model(**kwargs)
+      * build_model(cfg, hidden=..., ...) -> cfg + override
+    """
+    defaults = dict(
+        sample_rate=16000,
+        hidden=256,
+        num_layers=2,
+        bidirectional=True,
+        frame_ms=20,
+        lookahead_ms=0,
+        channels=64,
+        residual=True,
     )
+    if _is_mapping(cfg):
+        args_cfg = _get(cfg, "model.args", {}) or {}
+        sr = _get(cfg, "data.sample_rate", None)
+        if sr is not None:
+            args_cfg = dict(args_cfg)
+            args_cfg["sample_rate"] = sr
+        args = _merge(defaults, args_cfg)
+    else:
+        args = dict(defaults)
+    if overrides:
+        args = _merge(args, overrides)
+    return LSTMEnhancer(**args)

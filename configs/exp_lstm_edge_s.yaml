@@ -17,15 +17,17 @@ data:
 model:
   module: se_models.lstm_baseline.model:build_model
   args:
-    sample_rate: 16000
     hidden: 256
     num_layers: 2
     bidirectional: true
     frame_ms: 20
     lookahead_ms: 0
+    channels: 64
+    residual: true
 
 train:
-  batch_size: 8
+  batch_size: 2          # mic pentru 10.6 GB
+  accum_steps: 4         # batch efectiv 8
   epochs: 80
   optimizer: adam
   lr: 2.0e-3
@@ -58,3 +60,5 @@ inference:
 export:
   onnx:
     dynamic_axes: true
+    opset: 17
+    out: artifacts/export/lstm_edge_s.onnx

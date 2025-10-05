@@ -25,7 +25,7 @@ def main(cfg: Dict[str, Any]) -> int:
 
     if not _exists(manifest_off):
         raise SystemExit(
-            f"[eval:offline] Manifest lipsă: {manifest_off}\n" f"→ Rulează `make datasets` sau setează cfg.eval.offline.manifest / data.manifests.test_offline."
+            f"[eval:offline] Manifest lipsă: {manifest_off}\n→ Rulează `make datasets` sau setează cfg.eval.offline.manifest / data.manifests.test_offline."
         )
 
     print(f"[eval] Offline manifest: {manifest_off}")

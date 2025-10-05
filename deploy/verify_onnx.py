@@ -63,7 +63,7 @@ def _run_once(onnx_path: str, T: int = 16000):
     y = sess.run([out_name], {in_name: x})[0]
     if y.ndim == 2:
         y = y[:, None, :]
-    print(f"[run] onnxruntime: OK  in={(1,1,T)} out={y.shape}")
+    print(f"[run] onnxruntime: OK  in={(1, 1, T)} out={y.shape}")
     if not np.isfinite(y).all():
         raise SystemExit("Output conține NaN/Inf")
     return sess
@@ -141,7 +141,7 @@ def main():
     args = ap.parse_args()
 
     p = str(Path(args.onnx).expanduser())
-    print(f"[check] file: {p}  size={Path(p).stat().st_size/1e6:.2f} MB  sha256={_sha256(Path(p))[:16]}...")
+    print(f"[check] file: {p}  size={Path(p).stat().st_size / 1e6:.2f} MB  sha256={_sha256(Path(p))[:16]}...")
     _check(p)
     p2 = _simplify(p)
     sess = _run_once(p2, T=args.T)
