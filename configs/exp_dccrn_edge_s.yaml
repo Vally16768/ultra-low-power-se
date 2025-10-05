@@ -1,0 +1,79 @@
+experiment:
+  name: dccrn_edge_s
+  outdir: artifacts/exp/dccrn_edge_s
+
+data:
+  sample_rate: 16000
+  train:
+    clean_manifest: data/prepared/voicebank/train/clean.csv
+    noise_root: data/noise/demand
+    rir_root: data/rirs
+    snr_min: 0
+    snr_max: 20
+    # curriculum SNR: primele 10 epoci 0–10 dB, apoi 0–20 dB
+    curriculum:
+      warmup_epochs: 10
+      snr_min_after: 0
+      snr_max_after: 20
+    augment:
+      reverb_prob: 0.3
+      bandpass_prob: 0.3
+      pitch_pm_semitones: 0.0
+  val:
+    pairs_manifest: data/prepared/voicebank/val/manifests/pairs.csv
+  test:
+    pairs_manifest: data/prepared/voicebank/test/manifests/pairs.csv
+
+model:
+  module: se_models.dccrn.model:build_model
+  args:
+    # STFT (compatibil cu metricele tale 16 kHz)
+    fft: 320
+    hop: 160
+    win: 320
+    num_feats: 257
+    complex: true
+    use_causal: false        # pune true pentru streaming strict
+    enc_channels: [64,128,256,256,256]
+    dec_channels: [256,256,128,64,32]
+    rnn: "lstm"
+    rnn_hidden: 256
+    rnn_layers: 2
+    rnn_bidirectional: true  # dacă vrei streaming: false
+    mask_activation: "tanh"  # complex ratio mask
+
+train:
+  batch_size: 8
+  epochs: 90
+  optimizer: adam
+  lr: 2.0e-3
+  weight_decay: 0.0
+  scheduler: reduce_on_plateau
+  scheduler_patience: 4
+  grad_clip: 5.0
+  seed: 42
+  mixed_precision: true
+
+loss:
+  time_l1: 0.5
+  sisdr: 1.0
+  mrstft:
+    weight: 0.5
+    fft_sizes: [256,512,1024]
+    hops: [64,128,256]
+    wins: [256,512,1024]
+  # opțional: „perceptual head” (activează doar după 20 epoci)
+  perceptual:
+    use_dnsmos: true
+    start_epoch: 20
+    weight: 0.2
+
+eval:
+  metrics: ["pesq","stoi","si_sdr","seg_snr"]
+  streaming:
+    enabled: false
+    frame_ms: 20
+    lookahead_ms: 0
+export:
+  onnx:
+    dynamic_axes: true

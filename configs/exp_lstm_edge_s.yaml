@@ -1,0 +1,60 @@
+experiment:
+  name: lstm_edge_s
+  outdir: artifacts/exp/lstm_edge_s
+
+data:
+  sample_rate: 16000
+  train:
+    clean_manifest: data/prepared/voicebank/train/clean.csv
+    noise_root: data/noise/demand
+    snr_min: 0
+    snr_max: 20
+  val:
+    pairs_manifest: data/prepared/voicebank/val/manifests/pairs.csv
+  test:
+    pairs_manifest: data/prepared/voicebank/test/manifests/pairs.csv
+
+model:
+  module: se_models.lstm_baseline.model:build_model
+  args:
+    sample_rate: 16000
+    hidden: 256
+    num_layers: 2
+    bidirectional: true
+    frame_ms: 20
+    lookahead_ms: 0
+
+train:
+  batch_size: 8
+  epochs: 80
+  optimizer: adam
+  lr: 2.0e-3
+  grad_clip: 5.0
+  seed: 42
+  mixed_precision: true
+  scheduler:
+    name: reduce_on_plateau
+    mode: min
+    patience: 4
+    factor: 0.5
+
+loss:
+  time_l1: 0.5
+  sisdr: 1.0
+  mrstft:
+    weight: 0.5
+    fft_sizes: [256,512,1024]
+    hops: [64,128,256]
+    wins: [256,512,1024]
+
+eval:
+  metrics: ["pesq","stoi","si_sdr","seg_snr"]
+  offline:
+    outdir: artifacts/eval/lstm_edge_s/enhanced
+
+inference:
+  checkpoint: artifacts/exp/lstm_edge_s/best.ckpt
+
+export:
+  onnx:
+    dynamic_axes: true

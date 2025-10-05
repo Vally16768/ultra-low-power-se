@@ -8,6 +8,10 @@ from typing import Any, Dict, Callable
 import torch
 import yaml
 
+from .export_onnx_min import export_onnx
+
+__all__ = ["export_onnx"]
+
 # adaugă root și, dacă există, src în sys.path ca să găsim pachetele locale
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 for p in (ROOT, os.path.join(ROOT, "src")):
