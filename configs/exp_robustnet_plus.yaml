@@ -3,8 +3,8 @@ experiment: robustnet_plus_v2
 data:
   sample_rate: 16000
   segment_seconds: 2.0
-  train_csv: data/prepared/voicebank/train/manifests/pairs.csv
-  val_csv:   data/prepared/voicebank/val/manifests/pairs.csv
+  train_csv: data/prepared/train_mixes/manifests/pairs.csv
+  val_csv:   data/prepared/dev_mixes/manifests/pairs.csv
   test_csv:  data/prepared/voicebank/test/manifests/pairs.csv
 
 model:
