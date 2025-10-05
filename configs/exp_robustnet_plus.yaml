@@ -1,0 +1,49 @@
+experiment: robustnet_plus_v2
+
+data:
+  sample_rate: 16000
+  segment_seconds: 2.0
+  train_csv: data/prepared/voicebank/train/manifests/pairs.csv
+  val_csv:   data/prepared/voicebank/val/manifests/pairs.csv
+  test_csv:  data/prepared/voicebank/test/manifests/pairs.csv
+
+model:
+  class_path: se_models.robustnet_plus.model:RobustTCNPlusSE
+  enc_dim: 768
+  bottleneck: 384
+  num_stages: 3
+  blocks_per_stage: 4
+  layers_per_block: 8
+  kernel: 17
+  causal: false
+
+train:
+  outdir: artifacts/exp/robustnet_plus_v2
+  epochs: 80
+  batch_size: 6
+  num_workers: 4
+  lr: 2.0e-4
+  log_every: 50
+
+loss:
+  l1_w: 0.15
+  mrstft_w: 0.60
+  mrstft_mag_w: 0.5
+  mrstft_sc_w: 0.5
+  sisdr_w: 0.22
+  dc_w: 0.03
+
+eval:
+  outdir: artifacts/eval/max/enhanced
+
+inference:
+  checkpoint: null
+  in_wav: null
+  out_wav: enhanced.wav
+  outdir: artifacts/eval/max/enhanced
+
+export:
+  checkpoint: null
+  out: artifacts/export/robustnet_plus.onnx
+  opset: 17
+  sample_len: 16000
