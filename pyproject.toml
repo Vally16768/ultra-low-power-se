@@ -7,6 +7,9 @@ exclude = [
   "runners/export.py",  # acesta e YAML, nu Python
 ]
 
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
 ignore = [
