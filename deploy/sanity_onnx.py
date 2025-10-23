@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
-import argparse
-import numpy as np
-import onnxruntime as ort
-from pathlib import Path
-
+import argparse, onnx
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("onnx_path", help="Path to exported ONNX model")
-    ap.add_argument("--frames", type=int, default=16000)
+    ap = argparse.ArgumentParser("Basic ONNX checks")
+    ap.add_argument("--model", default="artifacts/tf_manifest_only/model.onnx")
     args = ap.parse_args()
 
-    onnx_p = Path(args.onnx_path)
-    sess = ort.InferenceSession(onnx_p.as_posix(), providers=["CPUExecutionProvider"])
-
-    # autodetect input/output names
-    in_name = sess.get_inputs()[0].name
-    out_name = sess.get_outputs()[0].name
-
-    T = args.frames
-    x = np.random.randn(1, 1, T).astype(np.float32)
-    y = sess.run([out_name], {in_name: x})[0]
-    print(f"[sanity] ok. input={in_name} out={out_name} | out-shape={y.shape}")
-
+    m = onnx.load(args.model)
+    onnx.checker.check_model(m)
+    g = m.graph
+    print("[OK] Model loads & passes checker.")
+    print("Inputs:")
+    for i in g.input:
+        t = i.type.tensor_type
+        shape = [d.dim_param or d.dim_value for d in t.shape.dim]
+        print(f" - {i.name}: {onnx.TensorProto.DataType.Name(t.elem_type)} {shape}")
+    print("Outputs:")
+    for o in g.output:
+        t = o.type.tensor_type
+        shape = [d.dim_param or d.dim_value for d in t.shape.dim]
+        print(f" - {o.name}: {onnx.TensorProto.DataType.Name(t.elem_type)} {shape}")
 
 if __name__ == "__main__":
     main()

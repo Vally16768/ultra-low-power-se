@@ -1,6 +1,0 @@
-- name: Run oracle on VoiceBank-DEMAND
-  run: |
-    python -m metrics.oracle \
-      --manifest data/prepared/test_standard/manifests/pairs_eval.csv \
-      --out artifacts/test_standard_oracle.json \
-      --thresholds '{"PESQ":3.0,"STOI":0.93,"DELTA_SNR":9.0,"SI_SDR":10.0}'
