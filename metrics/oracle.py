@@ -1,68 +1,111 @@
 """
-Oracolul: calculează metrici pe manifest (noisy, clean, [enhanced]),
-verifică pragurile, iese cu rc!=0 dacă oricare prag e încălcat.
-"""
+Evaluate intrusive metrics over a CSV manifest with columns:
+   clean,noisy,enhanced
+Writes a JSON report and exits non-zero if thresholds are violated.
 
-import csv, json, sys, numpy as np, soundfile as sf
-from .pesq_metric import pesq_score
-from .stoi_metric import stoi_score
-from .snr_metrics import delta_snr
-from .sisdr import sisdr
+Note: This script is for offline evaluation (not training).
+"""
+from __future__ import annotations
+import csv, json, sys, os
+import statistics as st
+import numpy as np
+import soundfile as sf
+
+# Import local metric modules
+from pesq import pesq_score
+from stoi import stoi_score
+from snr import delta_snr
+from sisdr import sisdr
+
 
 DEFAULT_THRESH = {
     "PESQ": 3.00,
     "STOI": 0.93,
-    "DELTA_SNR": 9.0,  # dB
-    "SI_SDR": 10.0,  # dB, opțional
-    "STREAM_LAT_MS": 40.0,  # doar pentru streaming runs (pass-through aici)
+    "DELTA_SNR": 9.0,   # dB
+    "SI_SDR": 10.0,     # dB
+    "STREAM_LAT_MS": 40.0,  # placeholder for streaming runs
 }
 
 
 def _load(path):
-    x, fs = sf.read(path, dtype="float32")
+    x, fs = sf.read(path, dtype="float32", always_2d=False)
     if x.ndim > 1:
-        x = x.mean(-1)
-    return x, fs
+        x = np.mean(x, axis=-1)  # fold to mono
+    return x.astype(np.float32), int(fs)
+
+
+def _resample_linear(x: np.ndarray, fs_in: int, fs_out: int) -> np.ndarray:
+    if fs_in == fs_out:
+        return x
+    t_in = np.linspace(0.0, 1.0, num=len(x), endpoint=False, dtype=np.float64)
+    n_out = int(np.floor(len(x) * (fs_out / fs_in)))
+    t_out = np.linspace(0.0, 1.0, num=n_out, endpoint=False, dtype=np.float64)
+    y = np.interp(t_out, t_in, x.astype(np.float64)).astype(np.float32)
+    return y
+
+
+def _match_sr_to(ref_sig: np.ndarray, ref_fs: int, x: np.ndarray, x_fs: int):
+    if x_fs != ref_fs:
+        x = _resample_linear(x, x_fs, ref_fs)
+    n = min(len(ref_sig), len(x))
+    return ref_sig[:n], x[:n], ref_fs
 
 
 def eval_pair(clean_path, noisy_path, enhanced_path):
-    clean, fs = _load(clean_path)
-    noisy, _ = _load(noisy_path)
-    enh, _ = _load(enhanced_path)
-    # metrici intruzive
-    pesq = pesq_score(clean, enh, fs)
-    stoi = stoi_score(clean, enh, fs)
-    dsnr = delta_snr(clean, noisy, enh)
-    sdr = sisdr(clean, enh)
+    clean, fs_c = _load(clean_path)
+    noisy, fs_n = _load(noisy_path)
+    enh, fs_e = _load(enhanced_path)
+
+    # Normalize SR: align noisy/enhanced to clean's SR/length
+    clean2, noisy2, fs_use = _match_sr_to(clean, fs_c, noisy, fs_n)
+    clean3, enh2, _ = _match_sr_to(clean2, fs_use, enh, fs_e)
+
+    # Intrusive metrics (raise on error; we want hard failure in CI)
+    pesq = pesq_score(clean3, enh2, fs_use)
+    stoi = stoi_score(clean3, enh2, fs_use, extended=False)
+    dsnr = delta_snr(clean3, noisy2, enh2)
+    sdr = sisdr(clean3, enh2)
     return {"PESQ": pesq, "STOI": stoi, "DELTA_SNR": dsnr, "SI_SDR": sdr}
+
+
+def _read_manifest(manifest_csv: str):
+    with open(manifest_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    if not rows:
+        raise ValueError("Manifest is empty.")
+    required = {"clean", "noisy", "enhanced"}
+    if not required.issubset(rows[0].keys()):
+        raise ValueError(f"Manifest must contain columns: {sorted(required)}")
+    return rows
 
 
 def main(manifest_csv: str, out_json: str, thresholds=None):
     thr = {**DEFAULT_THRESH, **(thresholds or {})}
-    rows, scores = [], []
-    with open(manifest_csv) as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            sc = eval_pair(r["clean"], r["noisy"], r["enhanced"])
-            scores.append(sc)
-            rows.append({**r, **sc})
+    rows_in = _read_manifest(manifest_csv)
 
-    # agregare
-    import statistics as st
+    scores, out_rows = [], []
+    for r in rows_in:
+        for k in ("clean", "noisy", "enhanced"):
+            if not os.path.exists(r[k]):
+                raise FileNotFoundError(f"{k} file not found: {r[k]}")
+        sc = eval_pair(r["clean"], r["noisy"], r["enhanced"])
+        scores.append(sc)
+        out_rows.append({**r, **{k: float(v) for k, v in sc.items()}})
 
     agg = {k: st.mean([s[k] for s in scores]) for k in scores[0].keys()}
+    failures = [(k, agg[k], thr[k]) for k in agg if k in thr and agg[k] < thr[k]]
 
-    # verdict
-    failures = []
-    for k, v in agg.items():
-        if k in thr and v < thr[k]:
-            failures.append((k, v, thr[k]))
-
-    report = {"thresholds": thr, "aggregate": agg, "count": len(scores), "failures": failures, "rows": rows}
+    report = {
+        "thresholds": thr,
+        "aggregate": agg,
+        "count": len(scores),
+        "failures": failures,
+        "rows": out_rows,
+    }
     with open(out_json, "w") as f:
         json.dump(report, f, indent=2)
 
-    # printf scurt
     print("[ORACLE]", {k: round(v, 4) for k, v in agg.items()})
     if failures:
         print("[ORACLE][FAIL]", failures)
@@ -70,18 +113,17 @@ def main(manifest_csv: str, out_json: str, thresholds=None):
 
 
 if __name__ == "__main__":
-    import argparse, json
-
+    import argparse, json as _json
     ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", required=True, help="CSV cu coloane: noisy,clean,enhanced")
+    ap.add_argument("--manifest", required=True, help="CSV with columns: noisy,clean,enhanced")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--thresholds", default=None, help="JSON string sau path la .json")
+    ap.add_argument("--thresholds", default=None, help="JSON string or path to .json")
     args = ap.parse_args()
     thr = None
     if args.thresholds:
         if args.thresholds.strip().startswith("{"):
-            thr = json.loads(args.thresholds)
+            thr = _json.loads(args.thresholds)
         else:
             with open(args.thresholds) as f:
-                thr = json.load(f)
+                thr = _json.load(f)
     main(args.manifest, args.out, thr)
