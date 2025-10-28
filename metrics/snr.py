@@ -5,7 +5,6 @@ from metrics_utils import to_mono, align, finite_or_default, clamp, LOG
 
 _EPS = 1e-12
 
-
 def _snr_db(clean: np.ndarray, test: np.ndarray) -> float:
     """
     SNR(clean, test) = 10*log10( sum(clean^2) / sum((clean - test)^2) ).

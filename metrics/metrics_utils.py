@@ -1,12 +1,10 @@
 from __future__ import annotations
 import logging
 import numpy as np
+from resample_audio import resample_audio  # noqa: F401
 
 LOG = logging.getLogger("metrics")
 LOG.addHandler(logging.NullHandler())
-
-_EPS = 1e-12
-
 
 def to_mono(x: np.ndarray) -> np.ndarray:
     """Fold to mono, flatten, float32."""
@@ -15,12 +13,10 @@ def to_mono(x: np.ndarray) -> np.ndarray:
         x = np.mean(x, axis=-1)
     return x.astype(np.float32).ravel()
 
-
 def align(a: np.ndarray, b: np.ndarray):
     """Trim both arrays to the same (min) length."""
     n = min(len(a), len(b))
     return a[:n], b[:n]
-
 
 def finite_or_default(value: float, default: float, name: str):
     """Return value if finite; otherwise log + return default."""
@@ -29,11 +25,9 @@ def finite_or_default(value: float, default: float, name: str):
         return float(default)
     return float(value)
 
-
 def clamp(val: float, lo: float, hi: float) -> float:
     """Clamp scalar to [lo, hi]."""
     return float(max(lo, min(hi, val)))
-
 
 def nan_to_num_inplace(x: np.ndarray, nan: float = 0.0):
     """Scrub NaN/Inf from waveforms (optional pre-step)."""

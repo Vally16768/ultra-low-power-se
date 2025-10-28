@@ -31,19 +31,19 @@ def stoi_score(ref: np.ndarray, deg: np.ndarray, sr: int, extended: bool = False
     return float(_stoi(ref, deg, sr, extended=extended))
 
 
-def stoi_score_safe(ref, deg, sr, extended: bool = False, default: float = 0.0) -> float:
-    """
-    Training-safe STOI/eSTOI:
-      * folds to mono, aligns
-      * clamps to [0,1]
-      * never returns NaN/Inf; returns default on failure
-    """
+from resample_audio import resample_audio 
+
+def stoi_score_safe(ref, deg, sr, extended: bool = False, default: float = 0.0, auto_resample: bool = False) -> float:
     try:
-        ref = to_mono(ref)
-        deg = to_mono(deg)
+        ref = to_mono(ref); deg = to_mono(deg)
         ref, deg = align(ref, deg)
         if len(ref) == 0:
             raise ValueError("Empty input")
+        target_sr = 10000 if not extended else sr  # classic STOI commonly uses 10k
+        if auto_resample and not extended and sr != 10000:
+            ref = resample_audio(ref, sr, 10000)
+            deg = resample_audio(deg, sr, 10000)
+            sr = 10000
         val = stoi_score(ref, deg, sr, extended=extended)
         return clamp(finite_or_default(val, default, "STOI"), 0.0, 1.0)
     except Exception as e:

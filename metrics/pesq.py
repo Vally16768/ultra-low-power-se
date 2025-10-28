@@ -4,6 +4,7 @@ import importlib
 import numpy as np
 
 from metrics_utils import to_mono, align, finite_or_default, clamp, LOG
+from resample_audio import resample_audio
 
 # Try to obtain a real PESQ backend without shadowing ourselves.
 _pesq_func = None
@@ -35,20 +36,9 @@ def _load_pesq_backend():
 
 _load_pesq_backend()
 
-
 def _auto_mode(sr: int) -> str:
     # ITU PESQ supports nb(8k) and wb(16k). We'll use nb at 8k, wb otherwise.
     return "nb" if sr <= 8000 else "wb"
-
-
-def _resample_linear(x: np.ndarray, fs_in: int, fs_out: int) -> np.ndarray:
-    if fs_in == fs_out:
-        return x.astype(np.float32)
-    t_in = np.linspace(0.0, 1.0, num=len(x), endpoint=False, dtype=np.float64)
-    n_out = int(np.floor(len(x) * (fs_out / fs_in)))
-    t_out = np.linspace(0.0, 1.0, num=n_out, endpoint=False, dtype=np.float64)
-    return np.interp(t_out, t_in, x.astype(np.float64)).astype(np.float32)
-
 
 def pesq_score(ref: np.ndarray, deg: np.ndarray, sr: int) -> float:
     """
@@ -75,7 +65,6 @@ def pesq_score(ref: np.ndarray, deg: np.ndarray, sr: int) -> float:
     mode = _auto_mode(sr)
     return float(_pesq_func(sr, ref, deg, mode))
 
-
 def pesq_score_safe(
     ref, deg, sr, default: float = 1.5, auto_resample: bool = True
 ) -> float:
@@ -95,8 +84,8 @@ def pesq_score_safe(
         # Resample to supported rates for the standard backend
         target_sr = 16000 if sr >= 12000 else 8000
         if auto_resample and sr not in (8000, 16000):
-            ref = _resample_linear(ref, sr, target_sr)
-            deg = _resample_linear(deg, sr, target_sr)
+            ref = resample_audio(ref, sr, target_sr)
+            deg = resample_audio(deg, sr, target_sr)
             sr = target_sr
 
         val = pesq_score(ref, deg, sr)

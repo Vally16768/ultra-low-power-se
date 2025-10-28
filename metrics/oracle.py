@@ -10,6 +10,7 @@ import csv, json, sys, os
 import statistics as st
 import numpy as np
 import soundfile as sf
+from resample_audio import resample_audio
 
 # Import local metric modules
 from pesq import pesq_score
@@ -26,30 +27,17 @@ DEFAULT_THRESH = {
     "STREAM_LAT_MS": 40.0,  # placeholder for streaming runs
 }
 
-
 def _load(path):
     x, fs = sf.read(path, dtype="float32", always_2d=False)
     if x.ndim > 1:
         x = np.mean(x, axis=-1)  # fold to mono
     return x.astype(np.float32), int(fs)
 
-
-def _resample_linear(x: np.ndarray, fs_in: int, fs_out: int) -> np.ndarray:
-    if fs_in == fs_out:
-        return x
-    t_in = np.linspace(0.0, 1.0, num=len(x), endpoint=False, dtype=np.float64)
-    n_out = int(np.floor(len(x) * (fs_out / fs_in)))
-    t_out = np.linspace(0.0, 1.0, num=n_out, endpoint=False, dtype=np.float64)
-    y = np.interp(t_out, t_in, x.astype(np.float64)).astype(np.float32)
-    return y
-
-
 def _match_sr_to(ref_sig: np.ndarray, ref_fs: int, x: np.ndarray, x_fs: int):
     if x_fs != ref_fs:
-        x = _resample_linear(x, x_fs, ref_fs)
+        x = resample_audio(x, x_fs, ref_fs)
     n = min(len(ref_sig), len(x))
     return ref_sig[:n], x[:n], ref_fs
-
 
 def eval_pair(clean_path, noisy_path, enhanced_path):
     clean, fs_c = _load(clean_path)

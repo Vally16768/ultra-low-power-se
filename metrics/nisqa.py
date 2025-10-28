@@ -5,7 +5,6 @@ import torch
 
 from metrics_utils import finite_or_default, clamp, LOG
 
-
 def _import_nisqa_class():
     try:
         from nisqa.NISQA_model import NISQA  # typical in repo
@@ -21,9 +20,7 @@ def _import_nisqa_class():
             "from the official repo and available in PYTHONPATH."
         )
 
-
 NISQA = _import_nisqa_class()
-
 
 def load_nisqa(model_ref: str, device: Optional[Union[str, torch.device]] = None):
     """
@@ -67,7 +64,6 @@ def load_nisqa(model_ref: str, device: Optional[Union[str, torch.device]] = None
         model.to(device)
     return model
 
-
 def nisqa_file(model, wav_path: str) -> float:
     """Predict MOS for a single WAV using the provided model."""
     if not os.path.exists(wav_path):
@@ -84,7 +80,6 @@ def nisqa_file(model, wav_path: str) -> float:
         if isinstance(out, (list, tuple)) and len(out) > 0:
             return float(out[0])
         return float(out)
-
 
 def nisqa_file_safe(model, wav_path: str, default: float = 2.5) -> float:
     """

@@ -11,7 +11,6 @@ except Exception as e:
     dnsmos_local = None
     _IMPORT_ERR = e
 
-
 def dnsmos_wav(path: str) -> Dict[str, float]:
     """
     DNSMOS P.835 (no-reference). Expects a WAV readable by dnsmos_local.
@@ -31,7 +30,6 @@ def dnsmos_wav(path: str) -> Dict[str, float]:
         raise RuntimeError(f"Unexpected DNSMOS response: {res!r}")
 
     return {k: float(res[k]) for k in ("mos_sig", "mos_bak", "mos_ovr")}
-
 
 def dnsmos_wav_safe(path: str, default: float = 2.5) -> Dict[str, float]:
     """

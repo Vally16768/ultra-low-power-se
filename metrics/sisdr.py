@@ -3,7 +3,6 @@ import numpy as np
 
 from metrics_utils import to_mono, align, finite_or_default, clamp, LOG
 
-
 def sisdr(s: np.ndarray, s_hat: np.ndarray, eps: float = 1e-8) -> float:
     """
     Scale-invariant SDR in dB. Raises on error.
@@ -24,7 +23,6 @@ def sisdr(s: np.ndarray, s_hat: np.ndarray, eps: float = 1e-8) -> float:
     num = float(np.sum(s_target ** 2) + eps)
     den = float(np.sum(e_noise ** 2) + eps)
     return 10.0 * np.log10(num / den)
-
 
 def sisdr_safe(s, s_hat, default: float = -30.0) -> float:
     """
