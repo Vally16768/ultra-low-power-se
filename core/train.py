@@ -86,11 +86,6 @@ def _resolve_data_paths() -> Tuple[Path, Path, Path]:
     """
     Resolve PROJ_ROOT, DATA_DIR, TRAIN_CSV with strong defaults,
     env overrides, and auto-discovery.
-
-    Env overrides:
-      - ULPSE_ROOT        -> repo root
-      - ULPSE_DATA        -> data directory that contains train.csv/test.csv
-      - ULPSE_TRAIN_CSV   -> direct path to train.csv
     """
     proj_root = _find_repo_root(_THIS_DIR)
 
@@ -334,9 +329,16 @@ def main():
         log_fn=log, default_chain=None,
     )
 
+    # ---- FORCE EVEN BATCHES across replicas (drop remainders) ----------------
+    def force_even_batches(ds: tf.data.Dataset, batch_size: int) -> tf.data.Dataset:
+        # strip existing batching and re-batch with drop_remainder=True
+        return ds.unbatch().batch(batch_size, drop_remainder=True)
+
+    train_ds = force_even_batches(train_ds, BATCH_SIZE)
+    val_ds   = force_even_batches(val_ds,   BATCH_SIZE)
+
     # Make datasets infinite and distributed-friendly
     opts = tf.data.Options()
-    # FIX: set attribute on existing experimental_distribute; don't construct a new DistributeOptions
     opts.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
     train_ds = train_ds.repeat().prefetch(AUTOTUNE).with_options(opts)
     val_ds   = val_ds.repeat().prefetch(AUTOTUNE).with_options(opts)
