@@ -56,7 +56,6 @@ def _glob_train_csvs(root: Path) -> List[Path]:
     dsets = root / "datasets"
     if not dsets.exists():
         return candidates
-    # Walk manually (faster than glob for big trees & lets us rank)
     for dirpath, dirnames, filenames in os.walk(dsets):
         if "train.csv" in filenames:
             candidates.append(Path(dirpath) / "train.csv")
@@ -71,14 +70,12 @@ def _rank_csv_candidates(cands: List[Path]) -> List[Tuple[int, Path]]:
     for p in cands:
         path_str = str(p).lower()
         score = 100
-        # bonuses
         if "voicebank" in path_str or "vbd" in path_str:
             score -= 40
         if "demand" in path_str:
             score -= 15
         if "16k" in path_str or "16000" in path_str:
             score -= 20
-        # shallower paths preferred
         depth_penalty = len(p.parts)
         score += depth_penalty // 3
         ranked.append((score, p))
@@ -189,6 +186,8 @@ from .data.dataset import build_tf_dataset, fail_fast_train_manifest
 from .utils.plotting import plot_history
 from .callbacks.lr_saver import LRSaver
 
+AUTOTUNE = tf.data.AUTOTUNE
+
 # -----------------------------------------------------------------------------#
 # More utils
 # -----------------------------------------------------------------------------#
@@ -249,8 +248,8 @@ def _build_train_val_csvs_from_train(train_csv: Path, out_dir: Path, val_ratio: 
 def si_snr_tf(y_true, y_pred, eps=tf.constant(1e-8, dtype=tf.float32)):
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
-    y_true_z = y_true - tf.reduce_mean(y_true, axis=1, keepdims=True)
-    y_pred_z = y_pred - tf.reduce_mean(y_pred, axis=1, keepdims=True)
+    y_true_z = tf.cast(y_true - tf.reduce_mean(y_true, axis=1, keepdims=True), tf.float32)
+    y_pred_z = tf.cast(y_pred - tf.reduce_mean(y_pred, axis=1, keepdims=True), tf.float32)
     dot   = tf.reduce_sum(y_pred_z * y_true_z, axis=1, keepdims=True)
     denom = tf.reduce_sum(y_true_z * y_true_z, axis=1, keepdims=True) + eps
     s_target = dot / denom * y_true_z
@@ -291,6 +290,14 @@ def main():
         strategy = tf.distribute.get_strategy()
         log("[GPU] No GPU found. Running on CPU.")
 
+    # Enforce batch divisibility across replicas (prevents AddN shape mismatch)
+    num_replicas = strategy.num_replicas_in_sync
+    if BATCH_SIZE % max(1, num_replicas) != 0:
+        raise ValueError(
+            f"[Config] BATCH_SIZE={BATCH_SIZE} must be divisible by replicas={num_replicas}. "
+            "Choose a multiple to ensure even per-replica batches."
+        )
+
     # --- Build deterministic 90/10 split from train CSV ----------------------
     if not TRAIN_CSV.exists():
         # Fail early with clear instructions
@@ -319,8 +326,6 @@ def main():
         sample_rate=SAMPLE_RATE, segment_seconds=SEGMENT_SECONDS, batch_size=BATCH_SIZE,
         log_fn=log, default_chain=GLOBAL_AUG_CHAIN,
     )
-    steps_per_epoch = max(1, n_train // BATCH_SIZE)
-    log(f"[Data] steps_per_epoch: {steps_per_epoch} (rows: {n_train})")
 
     log("[Data] Building validation pipeline (no augmentation)…")
     val_ds, n_val = build_tf_dataset(
@@ -328,8 +333,19 @@ def main():
         sample_rate=SAMPLE_RATE, segment_seconds=SEGMENT_SECONDS, batch_size=BATCH_SIZE,
         log_fn=log, default_chain=None,
     )
+
+    # Make datasets infinite and distributed-friendly
+    opts = tf.data.Options()
+    # FIX: set attribute on existing experimental_distribute; don't construct a new DistributeOptions
+    opts.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
+    train_ds = train_ds.repeat().prefetch(AUTOTUNE).with_options(opts)
+    val_ds   = val_ds.repeat().prefetch(AUTOTUNE).with_options(opts)
+
+    # Full steps (floor) to avoid partial batches
+    steps_per_epoch = max(1, n_train // BATCH_SIZE)
     validation_steps = max(1, n_val // BATCH_SIZE)
-    log(f"[Data] validation_steps: {validation_steps} (rows: {n_val})")
+    log(f"[Data] steps_per_epoch: {steps_per_epoch} (rows: {n_train}, batch: {BATCH_SIZE}, replicas: {num_replicas})")
+    log(f"[Data] validation_steps: {validation_steps} (rows: {n_val}, batch: {BATCH_SIZE})")
 
     # --- Model ----------------------------------------------------------------
     tf.keras.backend.clear_session()
