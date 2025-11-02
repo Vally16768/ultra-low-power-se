@@ -1,7 +1,7 @@
 from __future__ import annotations
 import logging
 import numpy as np
-from resample_audio import resample_audio  # noqa: F401
+from core.data.resample_audio import resample_audio  # noqa: F401
 
 LOG = logging.getLogger("metrics")
 LOG.addHandler(logging.NullHandler())

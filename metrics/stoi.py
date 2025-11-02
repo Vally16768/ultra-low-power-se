@@ -1,7 +1,7 @@
 from __future__ import annotations
 import numpy as np
 
-from metrics_utils import to_mono, align, finite_or_default, clamp, LOG
+from .metrics_utils import to_mono, align, finite_or_default, clamp, LOG
 
 try:
     from pystoi.stoi import stoi as _stoi
@@ -31,7 +31,7 @@ def stoi_score(ref: np.ndarray, deg: np.ndarray, sr: int, extended: bool = False
     return float(_stoi(ref, deg, sr, extended=extended))
 
 
-from resample_audio import resample_audio 
+from core.data.resample_audio import resample_audio 
 
 def stoi_score_safe(ref, deg, sr, extended: bool = False, default: float = 0.0, auto_resample: bool = False) -> float:
     try:

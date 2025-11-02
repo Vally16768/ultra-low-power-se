@@ -4,7 +4,7 @@ import numpy as np
 import soundfile as sf
 
 # Use unified, audio-safe resampler
-from resample_audio import resample_audio
+from core.data.resample_audio import resample_audio
 
 
 def _sanitize_wav(x: np.ndarray) -> np.ndarray:

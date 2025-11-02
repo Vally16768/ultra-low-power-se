@@ -3,8 +3,8 @@ import sys
 import importlib
 import numpy as np
 
-from metrics_utils import to_mono, align, finite_or_default, clamp, LOG
-from resample_audio import resample_audio
+from .metrics_utils import to_mono, align, finite_or_default, clamp, LOG
+from core.data.resample_audio import resample_audio
 
 # Try to obtain a real PESQ backend without shadowing ourselves.
 _pesq_func = None

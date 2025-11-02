@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Dict
 import os
 
-from metrics_utils import finite_or_default, clamp, LOG
+from .metrics_utils import finite_or_default, clamp, LOG
 
 try:
     # Official wrapper providing dnsmos_local.score_file()

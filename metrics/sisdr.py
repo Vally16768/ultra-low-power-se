@@ -1,7 +1,7 @@
 from __future__ import annotations
 import numpy as np
 
-from metrics_utils import to_mono, align, finite_or_default, clamp, LOG
+from .metrics_utils import to_mono, align, finite_or_default, clamp, LOG
 
 def sisdr(s: np.ndarray, s_hat: np.ndarray, eps: float = 1e-8) -> float:
     """

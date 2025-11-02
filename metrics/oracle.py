@@ -10,7 +10,7 @@ import csv, json, sys, os
 import statistics as st
 import numpy as np
 import soundfile as sf
-from resample_audio import resample_audio
+from core.data.resample_audio import resample_audio
 
 # Import local metric modules
 from pesq import pesq_score

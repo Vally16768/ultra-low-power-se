@@ -3,7 +3,7 @@ from typing import Optional, Union
 import os
 import torch
 
-from metrics_utils import finite_or_default, clamp, LOG
+from .metrics_utils import finite_or_default, clamp, LOG
 
 def _import_nisqa_class():
     try:
