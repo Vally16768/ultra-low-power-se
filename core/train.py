@@ -1,437 +1,266 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+core/train.py — Track 1 training:
+- Loads cached NOISY features (from your feature cache)
+- Target: CLEAN log-Mel computed on-the-fly with FeatureExtractor
+- Split: 85% train / 15% val from the train manifest
+- Model: core.models.model.get_model(input_dim)
+- Callbacks: EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, CSVLogger
+- Saves: metrics.json, history.csv/json, best.h5, and a few (noisy/clean/enhanced) wavs
+"""
+
 from __future__ import annotations
-
-import sys, json, random, hashlib, os, fnmatch
+import argparse, json, os, random, math
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
-# -----------------------------------------------------------------------------#
-# Utils (defined early because used by path discovery)
-# -----------------------------------------------------------------------------#
-def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
-def log(msg: str): print(msg, flush=True)
+import numpy as np
+import pandas as pd
+import soundfile as sf
+import librosa
+from tqdm import tqdm
 
-# -----------------------------------------------------------------------------#
-# Robust project/data path resolution
-# -----------------------------------------------------------------------------#
-_THIS_DIR = Path(__file__).resolve().parent  # .../ultra-low-power-se/core
-
-def _find_repo_root(start: Path) -> Path:
-    """
-    Discover repository root.
-    Priority:
-      1) ULPSE_ROOT env var
-      2) Walk upward for markers: datasets/, .git, pyproject.toml, runs/
-      3) If we're in .../repo/core, use parent
-      4) Fallback: start
-    """
-    env_root = os.environ.get("ULPSE_ROOT")
-    if env_root:
-        root = Path(env_root).resolve()
-        if root.exists():
-            return root
-
-    markers = {"datasets", ".git", "pyproject.toml", "runs"}
-    cur = start
-    for _ in range(10):  # up to 10 levels up
-        if any((cur / m).exists() for m in markers):
-            return cur
-        if cur.parent == cur:
-            break
-        cur = cur.parent
-
-    # Common layout: repo/core -> repo
-    if (start.parent / "datasets").exists() or (start.parent / ".git").exists():
-        return start.parent
-
-    return start
-
-def _glob_train_csvs(root: Path) -> List[Path]:
-    """
-    Recursively find all train.csv under root/datasets.
-    Returns absolute Paths. Does not follow symlinks outside datasets.
-    """
-    candidates: List[Path] = []
-    dsets = root / "datasets"
-    if not dsets.exists():
-        return candidates
-    for dirpath, dirnames, filenames in os.walk(dsets):
-        if "train.csv" in filenames:
-            candidates.append(Path(dirpath) / "train.csv")
-    return candidates
-
-def _rank_csv_candidates(cands: List[Path]) -> List[Tuple[int, Path]]:
-    """
-    Rank train.csv candidates: prefer paths containing 'voicebank' and '16k'.
-    Lower score is better.
-    """
-    ranked: List[Tuple[int, Path]] = []
-    for p in cands:
-        path_str = str(p).lower()
-        score = 100
-        if "voicebank" in path_str or "vbd" in path_str:
-            score -= 40
-        if "demand" in path_str:
-            score -= 15
-        if "16k" in path_str or "16000" in path_str:
-            score -= 20
-        depth_penalty = len(p.parts)
-        score += depth_penalty // 3
-        ranked.append((score, p))
-    ranked.sort(key=lambda x: (x[0], len(str(x[1]))))
-    return ranked
-
-def _resolve_data_paths() -> Tuple[Path, Path, Path]:
-    """
-    Resolve PROJ_ROOT, DATA_DIR, TRAIN_CSV with strong defaults,
-    env overrides, and auto-discovery.
-    """
-    proj_root = _find_repo_root(_THIS_DIR)
-
-    # 1) Direct CSV override
-    env_train_csv = os.environ.get("ULPSE_TRAIN_CSV")
-    if env_train_csv:
-        train_csv = Path(env_train_csv).resolve()
-        data_dir = train_csv.parent
-        return proj_root, data_dir, train_csv
-
-    # 2) Data dir override
-    env_data = os.environ.get("ULPSE_DATA")
-    if env_data:
-        data_dir = Path(env_data).resolve()
-        train_csv = data_dir / "train.csv"
-        return proj_root, data_dir, train_csv
-
-    # 3) Default conventional path
-    data_dir = proj_root / "datasets" / "voicebank-demand" / "16k"
-    train_csv = data_dir / "train.csv"
-    if train_csv.exists():
-        return proj_root, data_dir, train_csv
-
-    # 4) Auto-discover train.csv anywhere under datasets/
-    cands = _glob_train_csvs(proj_root)
-    if cands:
-        ranked = _rank_csv_candidates(cands)
-        best = ranked[0][1]
-        best_dir = best.parent
-        log("[Paths] Auto-discovered train.csv candidates (ranked):")
-        for score, p in ranked[:5]:
-            log(f"  score={score:3d}  {p}")
-        log(f"[Paths] -> Using: {best}")
-        return proj_root, best_dir, best
-
-    # 5) Nothing found; return conventional path (will error later with hint)
-    return proj_root, data_dir, train_csv
-
-_PROJ_ROOT, _DATA_DIR, _TRAIN_CSV = _resolve_data_paths()
-
-# Make repo root importable (for `python core/train.py`)
-if str(_PROJ_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJ_ROOT))
-
-RUN_DIR = _PROJ_ROOT / "runs" / "unet1d_voicebank16k"
-SAVE_DIR = RUN_DIR
-
-def _log_resolved_paths():
-    log("[Paths] Resolved repo root: " + str(_PROJ_ROOT))
-    log("[Paths] DATA_DIR: " + str(_DATA_DIR))
-    log("[Paths] TRAIN_CSV: " + str(_TRAIN_CSV))
-    log("[Paths] TRAIN_CSV exists: " + str(_TRAIN_CSV.exists()))
-    if not _TRAIN_CSV.exists():
-        # Helpful hints
-        alt = _THIS_DIR.parent / "datasets" / "voicebank-demand" / "16k" / "train.csv"
-        log("[Paths] Conventional expected path (sibling to core): " + str(alt))
-        log("[Hint] Set one of the following and re-run:")
-        log("       export ULPSE_TRAIN_CSV=/abs/path/to/train.csv")
-        log("       # or")
-        log("       export ULPSE_DATA=/abs/path/to/folder/with/train.csv")
-        log("       # or")
-        log("       export ULPSE_ROOT=/abs/path/to/repo_root  # if repo not detected")
-
-# -----------------------------------------------------------------------------#
-# Constants / Hyperparams
-# -----------------------------------------------------------------------------#
-SAMPLE_RATE       = 16000
-SEGMENT_SECONDS   = 2.0
-BATCH_SIZE        = 16
-EPOCHS            = 200
-SEED              = 41
-
-BASE_CHANNELS     = 64
-INPUT_LEN: Optional[int] = None
-
-PATIENCE_ES       = 7
-PATIENCE_RLR      = 3
-RLR_FACTOR        = 0.5
-VAL_SPLIT         = 0.10
-
-GLOBAL_AUG_CHAIN: List[Dict[str, Any]] = [
-    {"name": "add_colored_noise", "params": {"color": "pink", "snr_db": 12.0}},
-]
-
-# -----------------------------------------------------------------------------#
-# Imports that rely on repo code
-# -----------------------------------------------------------------------------#
 import tensorflow as tf
-from tensorflow import keras
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, CSVLogger
 
-from .models.unet1d import build_unet1d
-from .data.dataset import build_tf_dataset, fail_fast_train_manifest
-from .utils.plotting import plot_history
-from .callbacks.lr_saver import LRSaver
+# Local imports
+_THIS = Path(__file__).resolve()
+_ROOT = _THIS.parent.parent
+import sys
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-AUTOTUNE = tf.data.AUTOTUNE
+from core.features.feature import FeatureConfig, FeatureExtractor
 
-# -----------------------------------------------------------------------------#
-# More utils
-# -----------------------------------------------------------------------------#
-def set_all_seeds(seed: int = 123):
-    random.seed(seed)
-    import numpy as np
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
+try:
+    from metrics.pesq import pesq_score_safe as PESQ
+except Exception:
+    PESQ = None
+try:
+    from metrics.stoi import stoi_score_safe as STOI
+except Exception:
+    STOI = None
 
-def _stable_split_rows(rows: List[str], val_ratio: float, seed: int) -> Tuple[List[str], List[str]]:
-    assert 0.0 < val_ratio < 1.0
-    keyed = []
-    for ln in rows:
-        h = hashlib.md5((ln + f"|{seed}").encode("utf-8")).hexdigest()
-        key = int(h[:8], 16) / 0xFFFFFFFF  # [0,1)
-        keyed.append((key, ln))
-    keyed.sort(key=lambda x: x[0])
-    n = len(rows)
-    n_val = max(1, int(round(n * val_ratio)))
-    val_rows = [ln for _, ln in keyed[:n_val]]
-    train_rows = [ln for _, ln in keyed[n_val:]]
-    return train_rows, val_rows
 
-def _build_train_val_csvs_from_train(train_csv: Path, out_dir: Path, val_ratio: float, seed: int) -> Tuple[Path, Path, int, int]:
-    if not train_csv.exists():
-        raise FileNotFoundError(f"Missing train CSV: {train_csv}")
-    ensure_dir(out_dir)
+# ----------------------------- Utils ----------------------------------------- #
 
-    with open(train_csv, "r", encoding="utf-8") as f:
-        lines = [ln.rstrip("\n") for ln in f]
+def set_seed(seed: int = 41):
+    random.seed(seed); np.random.seed(seed); tf.random.set_seed(seed)
 
-    if not lines:
-        raise RuntimeError(f"Empty CSV: {train_csv}")
-    header, rows = lines[0], [ln for ln in lines[1:] if ln.strip()]
+def load_manifest(path: Path) -> pd.DataFrame:
+    return pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path)
 
-    if not rows:
-        raise RuntimeError(f"No data rows found in CSV: {train_csv}")
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-    tr_rows, va_rows = _stable_split_rows(rows, val_ratio, seed)
+def reconstruct_from_logmel(
+    noisy_wav: np.ndarray, sr: int, pred_logmel: np.ndarray,
+    stft_win: int, stft_hop: int, n_fft_eff: int, fmin: float, fmax: Optional[float],
+) -> np.ndarray:
+    S_noisy = librosa.stft(noisy_wav, n_fft=n_fft_eff, hop_length=stft_hop,
+                           win_length=stft_win, window="hann", center=False, pad_mode="constant")
+    mag_noisy = np.abs(S_noisy).astype(np.float32)
+    phase_noisy = np.angle(S_noisy).astype(np.float32)
+    mel_fb = librosa.filters.mel(sr=sr, n_fft=n_fft_eff, n_mels=pred_logmel.shape[1],
+                                 fmin=fmin, fmax=(sr/2 if fmax is None else fmax), htk=True)
+    mel_pow_hat = np.exp(pred_logmel).T  # [M,T]
+    pinv = np.linalg.pinv(mel_fb)        # [F,M]
+    lin_pow_hat = np.clip(pinv @ mel_pow_hat, 0.0, None)  # [F,T]
+    lin_mag_hat = np.sqrt(lin_pow_hat + 1e-9)
+    lin_mag_hat = np.minimum(lin_mag_hat, 2.0 * mag_noisy)
+    S_hat = lin_mag_hat * np.exp(1j * phase_noisy)
+    y_hat = librosa.istft(S_hat, hop_length=stft_hop, win_length=stft_win,
+                          window="hann", center=False, length=noisy_wav.shape[0])
+    return y_hat.astype(np.float32)
 
-    out_train = out_dir / "train_split.csv"
-    out_val   = out_dir / "val_split.csv"
 
-    with open(out_train, "w", encoding="utf-8") as f:
-        f.write(header + "\n")
-        f.write("\n".join(tr_rows) + ("\n" if tr_rows else ""))
+# ----------------------------- Data ------------------------------------------ #
 
-    with open(out_val, "w", encoding="utf-8") as f:
-        f.write(header + "\n")
-        f.write("\n".join(va_rows) + ("\n" if va_rows else ""))
+class SequencePadder(tf.keras.utils.Sequence):
+    """
+    Keras Sequence that:
+      - reads per-utterance noisy features from NPZ (from the manifest)
+      - computes per-utterance clean log-mel via FeatureExtractor
+      - pads variable length to the batch max and returns sample_weight mask
+    Inputs X:  [B, T, D] (feats: mel(48)+f0+vprob[+cepstra])
+    Targets y: [B, T, 48] (clean log-Mel)
+    sample_weight: [B, T] mask (1.0 for valid frames, 0.0 for padding)
+    """
+    def __init__(self, rows: List[Dict[str, Any]], batch_size: int,
+                 fx: FeatureExtractor, shuffle: bool = True):
+        self.rows = rows
+        self.batch_size = batch_size
+        self.fx = fx
+        self.shuffle = shuffle
+        self.idxs = np.arange(len(rows))
+        self.on_epoch_end()
 
-    return out_train, out_val, len(tr_rows), len(va_rows)
+    def __len__(self):
+        return math.ceil(len(self.rows) / self.batch_size)
 
-# -----------------------------------------------------------------------------#
-# Metric
-# -----------------------------------------------------------------------------#
-@tf.function
-def si_snr_tf(y_true, y_pred, eps=tf.constant(1e-8, dtype=tf.float32)):
-    y_true = tf.cast(y_true, tf.float32)
-    y_pred = tf.cast(y_pred, tf.float32)
-    y_true_z = tf.cast(y_true - tf.reduce_mean(y_true, axis=1, keepdims=True), tf.float32)
-    y_pred_z = tf.cast(y_pred - tf.reduce_mean(y_pred, axis=1, keepdims=True), tf.float32)
-    dot   = tf.reduce_sum(y_pred_z * y_true_z, axis=1, keepdims=True)
-    denom = tf.reduce_sum(y_true_z * y_true_z, axis=1, keepdims=True) + eps
-    s_target = dot / denom * y_true_z
-    e_noise  = y_pred_z - s_target
-    num = tf.reduce_sum(tf.square(s_target), axis=1) + eps
-    den = tf.reduce_sum(tf.square(e_noise), axis=1) + eps
-    ratio = num / den
-    return 10.0 * tf.math.log(ratio) / tf.math.log(tf.constant(10.0, dtype=tf.float32))
+    def on_epoch_end(self):
+        if self.shuffle: np.random.shuffle(self.idxs)
 
-# -----------------------------------------------------------------------------#
-# Main
-# -----------------------------------------------------------------------------#
+    def __getitem__(self, index: int):
+        batch_ids = self.idxs[index * self.batch_size : (index + 1) * self.batch_size]
+        Xs, Ys = [], []
+        maxT = 0
+        for bi in batch_ids:
+            row = self.rows[bi]
+            d = np.load(row["npz"], allow_pickle=False)
+            feats = d["feats"].astype(np.float32)               # [T, D]
+            clean_pack = self.fx.from_file(str(d["clean_path"]))
+            y = clean_pack["mel_log"].astype(np.float32)        # [T, 48]
+            T = min(len(feats), len(y))
+            feats = feats[:T]; y = y[:T]
+            Xs.append(feats); Ys.append(y)
+            if T > maxT: maxT = T
+
+        D = Xs[0].shape[-1]
+        X_pad = np.zeros((len(Xs), maxT, D), dtype=np.float32)
+        y_pad = np.zeros((len(Ys), maxT, Ys[0].shape[-1]), dtype=np.float32)
+        m_pad = np.zeros((len(Xs), maxT), dtype=np.float32)  # [B, T]
+        for i, (x, y) in enumerate(zip(Xs, Ys)):
+            T = x.shape[0]
+            X_pad[i, :T, :] = x
+            y_pad[i, :T, :] = y
+            m_pad[i, :T] = 1.0
+        # Keras expects sample_weight shape [B, T] for time-distributed losses
+        return (X_pad, m_pad[..., None]), y_pad, m_pad
+
+
+# ----------------------------- Model ----------------------------------------- #
+
+def get_compiled_model(input_dim: int, lr: float) -> tf.keras.Model:
+    from core.models.model import get_model
+    model = get_model(input_dim=input_dim)
+    opt = tf.keras.optimizers.Adam(learning_rate=lr)
+    # Loss returns [B,T]; Keras will apply sample_weight [B,T]
+    def masked_mse(y_true, y_pred):
+        return tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)  # [B,T]
+    model.compile(optimizer=opt, loss=masked_mse, metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")])
+    return model
+
+
+# ----------------------------- Main ------------------------------------------ #
+
 def main():
-    set_all_seeds(SEED)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--train-manifest", required=True, type=Path)
+    ap.add_argument("--test-manifest",  required=True, type=Path)
+    ap.add_argument("--outdir", required=True, type=Path)
+    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--seed", type=int, default=41)
+    ap.add_argument("--mel-ceps", type=int, default=24)
+    args = ap.parse_args()
 
-    # --- Paths resolved -------------------------------------------------------
-    _log_resolved_paths()
+    set_seed(args.seed)
+    ensure_dir(args.outdir)
+    (args.outdir / "wavs").mkdir(parents=True, exist_ok=True)
 
-    DATA_DIR   = _DATA_DIR
-    TRAIN_CSV  = _TRAIN_CSV
-    TEST_CSV   = DATA_DIR / "test.csv"  # may or may not exist
+    fcfg = FeatureConfig(mel_ceps_keep=args.mel_ceps)
+    fx = FeatureExtractor(fcfg)
 
-    # --- Folders --------------------------------------------------------------
-    save_dir = Path(SAVE_DIR)
-    ensure_dir(save_dir); ensure_dir(save_dir / "ckpt"); ensure_dir(save_dir / "logs"); ensure_dir(save_dir / "splits")
+    df_train = load_manifest(args.train_manifest)
+    df_test  = load_manifest(args.test_manifest)
 
-    # --- Devices / Strategy (float32) ----------------------------------------
-    gpus = tf.config.list_physical_devices("GPU")
-    if gpus:
-        for g in gpus:
-            try:
-                tf.config.experimental.set_memory_growth(g, True)
-            except Exception:
-                pass
-        strategy = tf.distribute.MirroredStrategy()
-        log(f"[GPU] Found {len(gpus)} GPU(s). Using MirroredStrategy (float32).")
-    else:
-        strategy = tf.distribute.get_strategy()
-        log("[GPU] No GPU found. Running on CPU.")
+    idxs = np.arange(len(df_train))
+    np.random.shuffle(idxs)
+    split_at = int(0.85 * len(idxs))
+    tr_rows = [df_train.iloc[i].to_dict() for i in idxs[:split_at]]
+    va_rows = [df_train.iloc[i].to_dict() for i in idxs[split_at:]]
 
-    # Enforce batch divisibility across replicas (prevents AddN shape mismatch)
-    num_replicas = strategy.num_replicas_in_sync
-    if BATCH_SIZE % max(1, num_replicas) != 0:
-        raise ValueError(
-            f"[Config] BATCH_SIZE={BATCH_SIZE} must be divisible by replicas={num_replicas}. "
-            "Choose a multiple to ensure even per-replica batches."
-        )
+    train_seq = SequencePadder(tr_rows, batch_size=args.batch_size, fx=fx, shuffle=True)
+    val_seq   = SequencePadder(va_rows, batch_size=args.batch_size, fx=fx, shuffle=False)
 
-    # --- Build deterministic 90/10 split from train CSV ----------------------
-    if not TRAIN_CSV.exists():
-        # Fail early with clear instructions
-        raise FileNotFoundError(
-            "\n[ERROR] train.csv not found.\n"
-            f"        Looked at: {TRAIN_CSV}\n"
-            "        Fix by setting one of:\n"
-            "          export ULPSE_TRAIN_CSV=/abs/path/to/train.csv\n"
-            "          export ULPSE_DATA=/abs/path/to/folder/with/train.csv\n"
-            "          export ULPSE_ROOT=/abs/path/to/repo_root\n"
-        )
+    sample_npz = np.load(tr_rows[0]["npz"])
+    D = int(sample_npz["feats"].shape[-1])
+    model = get_compiled_model(input_dim=D, lr=args.lr)
+    model.summary()
 
-    log(f"[Split] Creating 90/10 train/val from: {TRAIN_CSV}")
-    split_train_csv, split_val_csv, n_train_rows, n_val_rows = _build_train_val_csvs_from_train(
-        TRAIN_CSV, save_dir / "splits", VAL_SPLIT, SEED
-    )
-    log(f"[Split] -> train rows: {n_train_rows}, val rows: {n_val_rows}")
-
-    # --- Quick integrity check (manifest-only) --------------------------------
-    fail_fast_train_manifest(split_train_csv, log_fn=log, default_chain=GLOBAL_AUG_CHAIN)
-
-    # --- Datasets -------------------------------------------------------------
-    log("[Data] Building training pipeline (with GLOBAL_AUG_CHAIN)…")
-    train_ds, n_train = build_tf_dataset(
-        csv_path=split_train_csv, shuffle=True, seed=SEED, mode="train",
-        sample_rate=SAMPLE_RATE, segment_seconds=SEGMENT_SECONDS, batch_size=BATCH_SIZE,
-        log_fn=log, default_chain=GLOBAL_AUG_CHAIN,
-    )
-
-    log("[Data] Building validation pipeline (no augmentation)…")
-    val_ds, n_val = build_tf_dataset(
-        csv_path=split_val_csv, shuffle=False, seed=SEED+1, mode="val",
-        sample_rate=SAMPLE_RATE, segment_seconds=SEGMENT_SECONDS, batch_size=BATCH_SIZE,
-        log_fn=log, default_chain=None,
-    )
-
-    # ---- FORCE EVEN BATCHES across replicas (drop remainders) ----------------
-    def force_even_batches(ds: tf.data.Dataset, batch_size: int) -> tf.data.Dataset:
-        # strip existing batching and re-batch with drop_remainder=True
-        return ds.unbatch().batch(batch_size, drop_remainder=True)
-
-    train_ds = force_even_batches(train_ds, BATCH_SIZE)
-    val_ds   = force_even_batches(val_ds,   BATCH_SIZE)
-
-    # Make datasets infinite and distributed-friendly
-    opts = tf.data.Options()
-    opts.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-    train_ds = train_ds.repeat().prefetch(AUTOTUNE).with_options(opts)
-    val_ds   = val_ds.repeat().prefetch(AUTOTUNE).with_options(opts)
-
-    # Full steps (floor) to avoid partial batches
-    steps_per_epoch = max(1, n_train // BATCH_SIZE)
-    validation_steps = max(1, n_val // BATCH_SIZE)
-    log(f"[Data] steps_per_epoch: {steps_per_epoch} (rows: {n_train}, batch: {BATCH_SIZE}, replicas: {num_replicas})")
-    log(f"[Data] validation_steps: {validation_steps} (rows: {n_val}, batch: {BATCH_SIZE})")
-
-    # --- Model ----------------------------------------------------------------
-    tf.keras.backend.clear_session()
-    with strategy.scope():
-        model = build_unet1d(input_len=INPUT_LEN, base_ch=BASE_CHANNELS)
-        loss = keras.losses.MeanAbsoluteError()
-        metrics = [keras.metrics.MeanAbsoluteError(name="mae"), si_snr_tf]
-        optimizer = keras.optimizers.Adam(learning_rate=3e-4, clipnorm=1.0)
-        model.compile(optimizer=optimizer, loss=loss, metrics=metrics, run_eagerly=False)
-
-    model.summary(print_fn=lambda s: log(s))
-
-    # --- Callbacks ------------------------------------------------------------
+    ckpt_path = args.outdir / "best.h5"
     cbs = [
-        keras.callbacks.TerminateOnNaN(),
-        keras.callbacks.ModelCheckpoint(
-            filepath=str(save_dir / "ckpt" / "best.keras"),
-            save_best_only=True, monitor="val_loss", mode="min", verbose=1
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=RLR_FACTOR, patience=PATIENCE_RLR, min_delta=1e-4, verbose=1
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=PATIENCE_ES, restore_best_weights=True, verbose=1
-        ),
-        LRSaver(),
-        keras.callbacks.CSVLogger(str(save_dir / "logs" / "history.csv"), append=False),
-        keras.callbacks.TensorBoard(log_dir=str(save_dir / "tb"), write_graph=False),
+        EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1),
+        ModelCheckpoint(str(ckpt_path), monitor="val_loss", save_best_only=True, save_weights_only=False, verbose=1),
+        CSVLogger(str(args.outdir / "history.csv")),
     ]
 
-    # --- Train ----------------------------------------------------------------
+    # >>>>>>>>>>>>>>>>>> TRAIN (with sample_weight from sequence) <<<<<<<<<<<<<< #
     history = model.fit(
-        train_ds,
-        epochs=EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds,
-        validation_steps=validation_steps,
+        train_seq,
+        validation_data=val_seq,
+        epochs=args.epochs,
         callbacks=cbs,
         verbose=1,
     )
+    # Keras automatically reads sample_weight from the sequence's third return value.
 
-    # --- Save & Plot ----------------------------------------------------------
-    plot_history(history, save_dir / "logs")
-    log(f"[OK] Plots saved in {save_dir / 'logs'}")
+    # Save history
+    hist_dict = {k: [float(x) for x in v] for k, v in history.history.items()}
+    with open(args.outdir / "history.json", "w") as f:
+        json.dump(hist_dict, f, indent=2)
 
-    model.save(save_dir / "model.keras", include_optimizer=False)
-    try:
-        model.save(save_dir / "model.h5", include_optimizer=False)
-    except Exception as e:
-        log(f"[Warn] Could not save H5: {e}")
+    # ------------------------ Evaluate & dump wavs ---------------------------- #
+    metrics: Dict[str, Any] = {}
+    test_rows = [df_test.iloc[i].to_dict() for i in range(min(12, len(df_test)))]
+    sr = fcfg.sr
+    stft_win, stft_hop = fcfg.win_length, fcfg.hop_length
+    n_fft_eff = max(fcfg.n_fft, fcfg.win_length)
 
-    try:
-        tf.saved_model.save(model, str(save_dir / "model_saved"))
-        log("[OK] SavedModel exported.")
-    except Exception as e:
-        log(f"[Warn] Could not export SavedModel: {e}")
+    pesq_list, stoi_list, snr_in_list, snr_out_list = [], [], [], []
 
-    # --- History summary ------------------------------------------------------
-    hist = history.history
-    summary = {
-        "const": {
-            "TRAIN_CSV": str(_TRAIN_CSV),
-            "VAL_SPLIT": VAL_SPLIT,
-            "SAVE_DIR": str(SAVE_DIR),
-            "SAMPLE_RATE": SAMPLE_RATE,
-            "SEGMENT_SECONDS": SEGMENT_SECONDS,
-            "BATCH_SIZE": BATCH_SIZE,
-            "EPOCHS": EPOCHS,
-            "BASE_CHANNELS": BASE_CHANNELS,
-            "INPUT_LEN": INPUT_LEN,
-        },
-        "n_train_rows_csv": n_train_rows,
-        "n_val_rows_csv": n_val_rows,
-        "n_train_pipeline": n_train,
-        "n_val_pipeline": n_val,
-        "steps_per_epoch": steps_per_epoch,
-        "validation_steps": validation_steps,
-        "final": {k: float(hist[k][-1]) for k in hist if len(hist[k]) > 0},
-    }
-    (save_dir / "logs").mkdir(parents=True, exist_ok=True)
-    with open(save_dir / "logs" / "history.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    log(f"[OK] Summary saved: {save_dir / 'logs' / 'history.json'}")
+    for j, row in enumerate(tqdm(test_rows, desc="Render test samples")):
+        d = np.load(row["npz"], allow_pickle=False)
+        feats = d["feats"].astype(np.float32)
+        noisy_path = str(d["noisy_path"]); clean_path = str(d["clean_path"])
 
-# -----------------------------------------------------------------------------#
+        X = feats[None, ...]
+        M = np.ones((1, feats.shape[0], 1), dtype=np.float32)
+        pred_logmel = model.predict([X, M], verbose=0)[0]
+
+        noisy_wav, sr_n = sf.read(noisy_path, dtype="float32", always_2d=False)
+        clean_wav, sr_c = sf.read(clean_path, dtype="float32", always_2d=False)
+        if noisy_wav.ndim == 2: noisy_wav = noisy_wav.mean(axis=1)
+        if clean_wav.ndim == 2: clean_wav = clean_wav.mean(axis=1)
+        if sr_n != sr: noisy_wav = librosa.resample(noisy_wav, orig_sr=sr_n, target_sr=sr, res_type="kaiser_fast")
+        if sr_c != sr: clean_wav = librosa.resample(clean_wav, orig_sr=sr_c, target_sr=sr, res_type="kaiser_fast")
+
+        enh_wav = reconstruct_from_logmel(noisy_wav, sr, pred_logmel, stft_win, stft_hop, n_fft_eff, fcfg.fmin, fcfg.fmax)
+
+        base = args.outdir / "wavs" / f"sample_{j:02d}"
+        sf.write(str(base.with_suffix(".noisy.wav")), noisy_wav, sr)
+        sf.write(str(base.with_suffix(".clean.wav")), clean_wav, sr)
+        sf.write(str(base.with_suffix(".enh.wav")),   enh_wav,   sr)
+
+        def snr(ref, est, eps=1e-9):
+            num = np.sum(ref**2); den = np.sum((ref - est)**2) + eps
+            return 10.0 * np.log10((num + eps) / den)
+        snr_in_list.append(float(snr(clean_wav, noisy_wav)))
+        snr_out_list.append(float(snr(clean_wav, enh_wav)))
+
+        if PESQ is not None:
+            try: pesq_list.append(float(PESQ(clean_wav, enh_wav, sr)))
+            except Exception: pass
+        if STOI is not None:
+            try: stoi_list.append(float(STOI(clean_wav, enh_wav, sr)))
+            except Exception: pass
+
+    metrics["snr_in_mean"]  = float(np.mean(snr_in_list)) if snr_in_list else None
+    metrics["snr_out_mean"] = float(np.mean(snr_out_list)) if snr_out_list else None
+    metrics["snr_delta"]    = (metrics["snr_out_mean"] - metrics["snr_in_mean"]) if (metrics["snr_in_mean"] is not None and metrics["snr_out_mean"] is not None) else None
+    if pesq_list: metrics["pesq_mean"] = float(np.mean(pesq_list))
+    if stoi_list: metrics["stoi_mean"] = float(np.mean(stoi_list))
+
+    with open(args.outdir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print("[RESULTS]")
+    print(json.dumps(metrics, indent=2))
+
+
 if __name__ == "__main__":
     main()
