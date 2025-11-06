@@ -248,7 +248,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=41)
-    ap.add_argument("--mel-ceps", type=int, default=24)
+    ap.add_argument("--mel-ceps", type=int, default=0)
     args = ap.parse_args()
 
     set_seed(args.seed)

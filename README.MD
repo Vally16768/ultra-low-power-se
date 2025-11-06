@@ -23,10 +23,10 @@ nohup python core/train.py \
   --train-manifest runs/feat_cache/train_manifest.csv \
   --test-manifest  runs/feat_cache/test_manifest.csv \
   --train-stats    runs/feat_cache/train_feature_stats.npz \
-  --outdir         runs/exp_mask_head_v1 \
+  --outdir         runs/exp_mask_head_v2 \
   --batch-size 32 --epochs 1000 --lr 1e-3 \
-  > runs/exp_mask_head_v1/train.log 2>&1 &
-echo $! > runs/exp_mask_head_v1/train.pid
+  > runs/exp_mask_head_v2/train.log 2>&1 &
+echo $! > runs/exp_mask_head_v2/train.pid
 
 
 nohup bash download-dns-challenge-2.sh > download.log 2>&1 &
