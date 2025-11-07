@@ -3,10 +3,9 @@
 """
 core/models/model.py
 
-Best-quality Track 1 architecture (paper-derived, causal):
-- Stage 1: per-band mask (sigmoid gains) via 2×GRU backbone
-- Stage 2: deep filtering proxy via grouped (depthwise) causal Conv1D over Mel bands,
-          gated by voicing/periodicity features predicted from the backbone.
+Causal Track 1 model (fixed):
+- Stage 1: predict Δlog-Mel residual (tanh-scaled) so the net can both attenuate *and* amplify.
+- Stage 2: shallow deep-filter proxy over Mel bands, gated by voicing/aux features.
 
 I/O (matches core/train.py):
     get_model(input_dim: int) -> tf.keras.Model
@@ -17,7 +16,6 @@ I/O (matches core/train.py):
 from __future__ import annotations
 import tensorflow as tf
 from tensorflow.keras import layers as L
-
 
 # ----------------------------- Small helpers --------------------------------- #
 
@@ -31,7 +29,7 @@ def _causal_depthwise_conv_over_bands(x_mel: tf.Tensor, kernel_size: int, name: 
         filters=channels,
         kernel_size=kernel_size,
         padding="causal",
-        groups=channels,
+        groups=channels,          # per-band filtering
         use_bias=False,
         name=name,
     )(x_mel)
@@ -41,7 +39,6 @@ def _make_voicing_gate(backbone_h: tf.Tensor, aux_feats: tf.Tensor, name: str) -
     g_from_aux = L.Dense(48, activation="sigmoid", name=f"{name}_aux_dense")(aux_feats)
     g_from_h   = L.Dense(48, activation="sigmoid", name=f"{name}_h_dense")(backbone_h)
     return L.Multiply(name=f"{name}_mul")([g_from_aux, g_from_h])
-
 
 # ------------------------------- Model --------------------------------------- #
 
@@ -65,7 +62,7 @@ def get_model(input_dim: int,
     mel_log = L.Lambda(lambda z: z[:, :, :48], name="slice_mel")(xin)   # [B, T, 48]
     aux     = L.Lambda(lambda z: z[:, :, 48:], name="slice_aux")(xin)   # [B, T, D-48]
 
-    # ---------------- Stage 1: Mask head (coarse suppression) ---------------- #
+    # ---------------- Backbone ---------------- #
     h = L.GRU(hidden, return_sequences=True, name="gru1")(xin)
     h = _layer_norm(h, "ln1")
     if dropout and dropout > 0: h = L.Dropout(dropout, name="do1")(h)
@@ -74,21 +71,11 @@ def get_model(input_dim: int,
     h = _layer_norm(h, "ln2")
     if dropout and dropout > 0: h = L.Dropout(dropout, name="do2")(h)
 
-    # Bias-init to logit(0.8) so gains start near 0.8 (less early over-suppression)
-    gains = L.Dense(
-        48,
-        activation="sigmoid",
-        bias_initializer=tf.keras.initializers.Constant(1.386294),  # log(0.8/0.2)
-        name="gains",
-    )(h)  # [B, T, 48] in [0,1]
-
-    # Apply mask in log domain: log(|Y|^2) = log(|X|^2) + log(gain^2)
-    def _log_gain_layer(g):
-        eps = tf.constant(1e-6, dtype=g.dtype)
-        return tf.math.log(tf.clip_by_value(tf.square(g), eps, 1.0))
-    log_gain2 = L.Lambda(_log_gain_layer, name="log_gain2")(gains)  # [B, T, 48]
-
-    masked_logmel = L.Add(name="masked_logmel")([mel_log, log_gain2])  # [B, T, 48]
+    # -------- Stage 1 (FIXED): Δlog-Mel residual (allows boost + cut) -------- #
+    # Range ≈ ±1.5 natural-log power (~±6.5 dB).
+    delta = L.Dense(48, activation="tanh", name="delta_logmel")(h)   # [-1,1]
+    delta = L.Lambda(lambda d: d * 1.5, name="delta_scale")(delta)
+    masked_logmel = L.Add(name="masked_logmel")([mel_log, delta])    # [B, T, 48]
 
     # ----------- Stage 2: Deep filtering (fine cleanup of voiced speech) ------ #
     df_residual = _causal_depthwise_conv_over_bands(masked_logmel, kernel_size=df_kernel, name="df_depthwise")
@@ -102,5 +89,8 @@ def get_model(input_dim: int,
     logmel_hat = L.Dense(48, activation=None, name="out_proj")(logmel_hat)
 
     model = tf.keras.Model(inputs=[xin, xmsk], outputs=logmel_hat, name="track1_mask_df")
-    model.add_metric(L.Lambda(lambda g: tf.reduce_mean(g))(gains), name="gain_mean", aggregation="mean")
+
+    # Track the magnitude of edits rather than the old gain mean
+    model.add_metric(L.Lambda(lambda d: tf.reduce_mean(tf.abs(d)))(delta),
+                     name="delta_abs_mean", aggregation="mean")
     return model

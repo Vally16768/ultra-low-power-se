@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/train.py — Track 1 training (SOTA-ready, minimal changes)
+core/train.py — Track 1 training (fixed)
 
-- Z-norm inputs/targets, time-masked loss (as before).
-- Safe imports for local metrics (pesq.py, stoi.py, sisdr.py, dnsmos.py, nisqa.py).
-- Extra eval: SI-SDR (intrusive) + DNSMOS (SIG/BAK/OVR) + NISQA MOS (non-intrusive).
-- SavedModel checkpoint directory (no native .keras 'options' issue).
+Key fixes:
+- voiced-frame sample_weight (0.3..1.0) instead of uniform masking
+- robust L1 spectral loss (+tiny energy term) and Adam(clipnorm=1.0)
+- SI-SDR import fixed
+- reconstruction cap relaxed from 2.0× -> 3.0×
 """
 
 from __future__ import annotations
-import argparse, json, os, random, math
+import argparse, json, os, random
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ from tqdm import tqdm
 
 import tensorflow as tf
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, CSVLogger
+from tensorflow.keras.utils import Sequence
 
 # ----------------------------- Local imports --------------------------------- #
 _THIS = Path(__file__).resolve()
@@ -30,13 +32,11 @@ import sys
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# Feature front-end (adjust to your project structure as before)
+# Front-end (must match your cache)
 from core.features.feature import FeatureConfig, FeatureExtractor
+from core.models.model import get_model
 
-# ---- Metrics: try both packaged and local single-file fallbacks ------------- #
-def _try_import(default=None):
-    return default
-
+# ---- Metrics: prefer local single-file fallbacks you provided ---------------- #
 # PESQ
 try:
     from metrics.pesq import pesq_score_safe as PESQ
@@ -55,12 +55,12 @@ except Exception:
     except Exception:
         STOI = None
 
-# SI-SDR
+# SI-SDR (FIX: use the safe variant you shipped)
 try:
-    from metrics.sisdr import sisdr_np as SISDR
+    from metrics.sisdr import sisdr_safe as SISDR
 except Exception:
     try:
-        from sisdr import sisdr_np as SISDR
+        from sisdr import sisdr_safe as SISDR
     except Exception:
         SISDR = None
 
@@ -94,36 +94,6 @@ def load_manifest(path: Path) -> pd.DataFrame:
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-def reconstruct_from_logmel(
-    noisy_wav: np.ndarray, sr: int, pred_logmel: np.ndarray,
-    stft_win: int, stft_hop: int, n_fft_eff: int, fmin: float, fmax: Optional[float],
-) -> np.ndarray:
-    """Reconstruct waveform from predicted log-Mel using noisy phase (stable, conservative)."""
-    S_noisy = librosa.stft(noisy_wav, n_fft=n_fft_eff, hop_length=stft_hop,
-                           win_length=stft_win, window="hann", center=False, pad_mode="constant")
-    mag_noisy = np.abs(S_noisy).astype(np.float32)
-    phase_noisy = np.angle(S_noisy).astype(np.float32)
-
-    mel_fb = librosa.filters.mel(
-        sr=sr, n_fft=n_fft_eff, n_mels=pred_logmel.shape[1],
-        fmin=fmin, fmax=(sr/2 if fmax is None else fmax), htk=True
-    )  # [M,F]
-    mel_pow_hat = np.exp(pred_logmel).T  # [M,T]
-    pinv = np.linalg.pinv(mel_fb)        # [F,M]
-    lin_pow_hat = np.clip(pinv @ mel_pow_hat, 0.0, None)  # [F,T]
-    lin_mag_hat = np.sqrt(lin_pow_hat + 1e-9)
-
-    # Conservative cap to avoid extreme amplification (prevents SNR collapse)
-    lin_mag_hat = np.minimum(lin_mag_hat, 2.0 * mag_noisy)
-
-    S_hat = lin_mag_hat * np.exp(1j * phase_noisy)
-    y_hat = librosa.istft(S_hat, hop_length=stft_hop, win_length=stft_win,
-                          window="hann", center=False, length=noisy_wav.shape[0])
-    return y_hat.astype(np.float32)
-
-
-# --- Normalization helpers --------------------------------------------------- #
-
 def load_feature_stats(stats_npz_path: Path):
     d = np.load(str(stats_npz_path))
     mel_mean = d["mel_mean"].astype(np.float32)   # [48]
@@ -147,102 +117,143 @@ def z_norm_f0(f0: np.ndarray, f0_mean: float, f0_std: float) -> np.ndarray:
         out[vmask] = (f0[vmask] - f0_mean) / f0_std
     return out
 
+# ----------------------------- Data loader ----------------------------------- #
 
-# ----------------------------- Data ------------------------------------------ #
-
-class SequencePadder(tf.keras.utils.Sequence):
+class SequencePadder(Sequence):
     """
-    Reads per-utterance noisy features from NPZ (from the manifest),
-    computes clean log-Mel on-the-fly, z-normalizes inputs/targets,
-    returns padded batches with [B,T] sample_weight mask.
+    Keras Sequence that:
+      - reads cached NPZ ('feats' for *noisy*),
+      - extracts target clean Mel on the fly from 'clean' path,
+      - normalizes inputs/targets with train stats,
+      - returns voiced-weighted sample_weight in [0.3, 1.0].
     """
-    def __init__(self, rows: List[Dict[str, Any]], batch_size: int,
+    def __init__(self,
+                 rows: List[Dict[str, Any]],
+                 batch_size: int,
                  fx: FeatureExtractor,
                  mel_mean: np.ndarray, mel_std: np.ndarray,
                  f0_mean: float, f0_std: float,
                  shuffle: bool = True):
-        self.rows = rows
-        self.batch_size = batch_size
+        self.rows = list(rows)
+        self.batch_size = int(batch_size)
         self.fx = fx
-        self.shuffle = shuffle
-        self.mel_mean = mel_mean
-        self.mel_std  = mel_std
-        self.f0_mean  = f0_mean
-        self.f0_std   = f0_std
-        self.idxs = np.arange(len(rows))
+        self.mel_mean, self.mel_std = mel_mean, mel_std
+        self.f0_mean, self.f0_std = float(f0_mean), float(f0_std)
+        self.shuffle = bool(shuffle)
+        self.indices = np.arange(len(self.rows))
         self.on_epoch_end()
 
-    def __len__(self):
-        return math.ceil(len(self.rows) / self.batch_size)
+    def __len__(self) -> int:
+        return int(np.ceil(len(self.rows) / self.batch_size))
 
     def on_epoch_end(self):
         if self.shuffle:
-            np.random.shuffle(self.idxs)
+            np.random.shuffle(self.indices)
 
-    def __getitem__(self, index: int):
-        batch_ids = self.idxs[index * self.batch_size : (index + 1) * self.batch_size]
-        Xs, Ys = [], []
+    def __getitem__(self, idx: int):
+        sl = slice(idx*self.batch_size, min((idx+1)*self.batch_size, len(self.rows)))
+        ids = self.indices[sl]
+        return self._make_batch([self.rows[i] for i in ids])
+
+    def _make_batch(self, batch_rows: List[Dict[str, Any]]):
+        Xs, Ys, Ws = [], [], []
         maxT = 0
-        for bi in batch_ids:
-            row = self.rows[bi]
+
+        for row in batch_rows:
             d = np.load(row["npz"], allow_pickle=False)
+            feats = d["feats"].astype(np.float32)  # [T,D] (48 Mel + F0 + vprob [+ ceps])
+            T, D = feats.shape
 
-            feats = d["feats"].astype(np.float32)               # [T, D] noisy features
-            clean_pack = self.fx.from_file(str(d["clean_path"]))
-            y_mel = clean_pack["mel_log"].astype(np.float32)    # [T, 48] clean (unnormalized)
-
-            T = min(len(feats), len(y_mel))
-            feats = feats[:T]
-            y_mel = y_mel[:T]
-
-            # Inputs: Mel & F0 z-norm; keep vprob/cepstra as they are
             mel_in = feats[:, :48]
             f0_in  = feats[:, 48:49]
             vprob  = feats[:, 49:50]
-            ceps   = feats[:, 50:] if feats.shape[1] > 50 else None
+            ceps   = feats[:, 50:] if D > 50 else None
 
-            mel_in = z_norm_mel(mel_in, self.mel_mean, self.mel_std)
+            # Normalize inputs using train stats
+            mel_in = z_norm_mel(mel_in, self.mel_mean, self.mel_std)   # [T,48]
             f0_in  = z_norm_f0(f0_in.squeeze(-1), self.f0_mean, self.f0_std)[:, None]
-
             feats_n = np.concatenate([mel_in, f0_in, vprob], axis=-1) if ceps is None \
                       else np.concatenate([mel_in, f0_in, vprob, ceps], axis=-1)
 
-            # Targets: Mel z-norm
-            y_mel_n = z_norm_mel(y_mel, self.mel_mean, self.mel_std)
+            # Target: CLEAN Mel (unnormalized) → z-norm
+            clean_path = str(row["clean"])
+            pack_clean = self.fx.from_file(clean_path)
+            y_mel = pack_clean["mel_log"].astype(np.float32)           # [T2,48]
+            T2 = y_mel.shape[0]
+            Tmin = min(T, T2)
 
-            Xs.append(feats_n)
-            Ys.append(y_mel_n)
-            if T > maxT:
-                maxT = T
+            Xs.append(feats_n[:Tmin])
+            Ys.append(z_norm_mel(y_mel[:Tmin], self.mel_mean, self.mel_std))
 
-        D = Xs[0].shape[-1]
-        X_pad = np.zeros((len(Xs), maxT, D), dtype=np.float32)
-        y_pad = np.zeros((len(Ys), maxT, Ys[0].shape[-1]), dtype=np.float32)
-        m_pad = np.zeros((len(Xs), maxT), dtype=np.float32)  # [B, T]
-        for i, (x, y) in enumerate(zip(Xs, Ys)):
-            T = x.shape[0]
-            X_pad[i, :T, :] = x
-            y_pad[i, :T, :] = y
-            m_pad[i, :T] = 1.0
-        return (X_pad, m_pad[..., None]), y_pad, m_pad
+            # Voiced weighting (0.3..1.0)
+            vseq = vprob[:Tmin, 0]
+            Ws.append((0.3 + 0.7 * vseq).astype(np.float32))
 
+            if Tmin > maxT:
+                maxT = int(Tmin)
 
-# ----------------------------- Model ----------------------------------------- #
+        Dn = Xs[0].shape[-1]
+        X_pad = np.zeros((len(Xs), maxT, Dn), dtype=np.float32)
+        y_pad = np.zeros((len(Ys), maxT, 48), dtype=np.float32)
+        m_pad = np.zeros((len(Xs), maxT), dtype=np.float32)   # time mask for inputs (for completeness)
+        w_pad = np.zeros((len(Xs), maxT), dtype=np.float32)   # sample_weight used by Keras
+
+        for i, (x, y, w) in enumerate(zip(Xs, Ys, Ws)):
+            t = x.shape[0]
+            X_pad[i, :t, :] = x
+            y_pad[i, :t, :] = y
+            m_pad[i, :t] = 1.0
+            w_pad[i, :t] = w
+
+        # Keras will apply w_pad to the per-timestep loss we return
+        return (X_pad, m_pad[..., None]), y_pad, w_pad
+
+# ------------------------- Reconstruction helper ----------------------------- #
+
+def reconstruct_from_logmel(
+    noisy_wav: np.ndarray, sr: int, pred_logmel: np.ndarray,
+    stft_win: int, stft_hop: int, n_fft_eff: int, fmin: float, fmax: Optional[float],
+) -> np.ndarray:
+    """Reconstruct waveform from predicted log-Mel using noisy phase (stable, conservative)."""
+    S_noisy = librosa.stft(noisy_wav, n_fft=n_fft_eff, hop_length=stft_hop,
+                           win_length=stft_win, window="hann", center=False, pad_mode="constant")
+    mag_noisy = np.abs(S_noisy).astype(np.float32)
+    phase_noisy = np.angle(S_noisy).astype(np.float32)
+
+    mel_fb = librosa.filters.mel(
+        sr=sr, n_fft=n_fft_eff, n_mels=pred_logmel.shape[1],
+        fmin=fmin, fmax=(sr/2 if fmax is None else fmax), htk=True
+    )  # [M,F]
+    mel_pow_hat = np.exp(pred_logmel).T  # [M,T]
+    pinv = np.linalg.pinv(mel_fb)        # [F,M]
+    lin_pow_hat = np.clip(pinv @ mel_pow_hat, 0.0, None)  # [F,T]
+    lin_mag_hat = np.sqrt(lin_pow_hat + 1e-9)
+
+    # Relaxed cap (FIX): allow a bit more gain while staying safe
+    lin_mag_hat = np.minimum(lin_mag_hat, 3.0 * mag_noisy)
+
+    S_hat = lin_mag_hat * np.exp(1j * phase_noisy)
+    y_hat = librosa.istft(S_hat, hop_length=stft_hop, win_length=stft_win,
+                          window="hann", center=False, length=noisy_wav.shape[0])
+    return y_hat.astype(np.float32)
+
+# ----------------------------- Model / loss ---------------------------------- #
 
 def get_compiled_model(input_dim: int, lr: float) -> tf.keras.Model:
-    from core.models.model import get_model
     model = get_model(input_dim=input_dim)
-    opt = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    # Slightly more stable optimizer
+    opt = tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0)
 
     # Per-frame loss; sample_weight [B,T] applied by Keras from the Sequence
     def masked_loss(y_true, y_pred):
-        # MSE on Mel
-        mse = tf.reduce_mean(tf.square(y_true - y_pred), axis=-1)  # [B,T]
+        # Robust L1 on log-Mel (correlates better than MSE for perceptual changes)
+        l1  = tf.reduce_mean(tf.abs(y_true - y_pred), axis=-1)  # [B,T]
         # Small energy alignment on framewise sum of Mel (stabilizes loudness)
         e_true = tf.reduce_sum(y_true, axis=-1)  # [B,T]
         e_pred = tf.reduce_sum(y_pred, axis=-1)  # [B,T]
         e_l1 = tf.abs(e_true - e_pred)
-        return mse + 0.02 * e_l1
+        return l1 + 0.02 * e_l1
 
     model.compile(
         optimizer=opt,
@@ -250,7 +261,6 @@ def get_compiled_model(input_dim: int, lr: float) -> tf.keras.Model:
         metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
     )
     return model
-
 
 # ----------------------------- Main ------------------------------------------ #
 
@@ -303,7 +313,7 @@ def main():
     model = get_compiled_model(input_dim=D, lr=args.lr)
     model.summary()
 
-    # Callbacks (SavedModel dir to avoid native .keras options issues)
+    # Callbacks (SavedModel dir to avoid native .keras 'options' issue)
     ckpt_path = args.outdir / "best_tf"
     cbs = [
         EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1),
@@ -381,11 +391,11 @@ def main():
         sf.write(str(base.with_suffix(".enh.wav")),   enh_wav,   sr)
 
         # Intrusive metrics
-        def snr(ref, est, eps=1e-9):
+        def _snr(ref, est, eps=1e-9):
             num = np.sum(ref**2); den = np.sum((ref - est)**2) + eps
             return 10.0 * np.log10((num + eps) / den)
-        snr_in_list.append(float(snr(clean_wav, noisy_wav)))
-        snr_out_list.append(float(snr(clean_wav, enh_wav)))
+        snr_in_list.append(float(_snr(clean_wav, noisy_wav)))
+        snr_out_list.append(float(_snr(clean_wav, enh_wav)))
 
         if SISDR is not None:
             try: sisdr_list.append(float(SISDR(clean_wav, enh_wav)))
@@ -399,13 +409,12 @@ def main():
             try: stoi_list.append(float(STOI(clean_wav, enh_wav, sr)))
             except Exception: pass
 
-        # Non-intrusive metrics (reference-free)
         if DNSMOS is not None:
             try:
-                dns = DNSMOS(enh_wav, sr)  # dict with SIG/BAK/OVR
-                dnsmos_sig.append(float(dns.get("SIG", 0.0)))
-                dnsmos_bak.append(float(dns.get("BAK", 0.0)))
-                dnsmos_ovr.append(float(dns.get("OVR", 0.0)))
+                r = DNSMOS(enh_wav, sr)  # dict with SIG/BAK/OVR
+                dnsmos_sig.append(float(r.get("SIG", 0.0)))
+                dnsmos_bak.append(float(r.get("BAK", 0.0)))
+                dnsmos_ovr.append(float(r.get("OVR", 0.0)))
             except Exception:
                 pass
 
@@ -414,23 +423,20 @@ def main():
             except Exception: pass
 
     # Aggregate
-    metrics["snr_in_mean"]  = float(np.mean(snr_in_list)) if snr_in_list else None
-    metrics["snr_out_mean"] = float(np.mean(snr_out_list)) if snr_out_list else None
-    metrics["snr_delta"]    = (metrics["snr_out_mean"] - metrics["snr_in_mean"]) if (metrics["snr_in_mean"] is not None and metrics["snr_out_mean"] is not None) else None
-    if sisdr_list: metrics["sisdr_mean"] = float(np.mean(sisdr_list))
-    if pesq_list:  metrics["pesq_mean"]  = float(np.mean(pesq_list))
-    if stoi_list:  metrics["stoi_mean"]  = float(np.mean(stoi_list))
-    if dnsmos_sig: metrics["dnsmos_sig_mean"] = float(np.mean(dnsmos_sig))
-    if dnsmos_bak: metrics["dnsmos_bak_mean"] = float(np.mean(dnsmos_bak))
-    if dnsmos_ovr: metrics["dnsmos_ovr_mean"] = float(np.mean(dnsmos_ovr))
-    if nisqa_list: metrics["nisqa_mos_mean"]   = float(np.mean(nisqa_list))
+    def _mean_safe(xs): return float(np.mean(xs)) if xs else float("nan")
+    metrics["SNR_IN"]  = _mean_safe(snr_in_list)
+    metrics["SNR_OUT"] = _mean_safe(snr_out_list)
+    metrics["SI_SDR"]  = _mean_safe(sisdr_list)
+    metrics["PESQ"]    = _mean_safe(pesq_list)
+    metrics["STOI"]    = _mean_safe(stoi_list)
+    metrics["DNSMOS_SIG"] = _mean_safe(dnsmos_sig)
+    metrics["DNSMOS_BAK"] = _mean_safe(dnsmos_bak)
+    metrics["DNSMOS_OVR"] = _mean_safe(dnsmos_ovr)
+    metrics["NISQA"]      = _mean_safe(nisqa_list)
 
     with open(args.outdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
-
-    print("[RESULTS]")
-    print(json.dumps(metrics, indent=2))
-
+    print("[VAL]", {k: (None if np.isnan(v) else round(v, 4)) for k, v in metrics.items()})
 
 if __name__ == "__main__":
     main()
