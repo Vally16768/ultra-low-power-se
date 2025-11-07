@@ -1,35 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/train.py — Track 1 training (SOTA-ready)
+core/train.py — Track 1 training (SOTA-ready, minimal changes)
 
-Key features
-------------
-- Uses cached NOISY features (NPZs listed in manifest).
-- Targets: CLEAN log-Mel computed on-the-fly with the same front-end.
-- 85/15 train/val split from the train manifest.
-- Proper SOTA normalization:
-    * Inputs: z-norm Mel (48) and z-norm voiced F0; vprob untouched; cepstra (if any) untouched.
-    * Targets: z-norm clean log-Mel (48).
-    * Denormalize predicted log-Mel before waveform reconstruction.
-- Masked time-distributed loss with a small log-energy alignment term.
-- Callbacks: EarlyStopping, ReduceLROnPlateau, ModelCheckpoint(.keras), CSVLogger.
-- Saves: history.json/csv, metrics.json, best SavedModel dir, and sample wavs (noisy/clean/enh).
-
-CLI example
------------
-python core/train.py \
-  --train-manifest runs/feat_cache/train_manifest.csv \
-  --test-manifest  runs/feat_cache/test_manifest.csv \
-  --train-stats    runs/feat_cache/train_feature_stats.npz \
-  --outdir         runs/track1_run1 \
-  --batch-size 16 --epochs 100 --lr 1e-3 --mel-ceps 24
+- Z-norm inputs/targets, time-masked loss (as before).
+- Safe imports for local metrics (pesq.py, stoi.py, sisdr.py, dnsmos.py, nisqa.py).
+- Extra eval: SI-SDR (intrusive) + DNSMOS (SIG/BAK/OVR) + NISQA MOS (non-intrusive).
+- SavedModel checkpoint directory (no native .keras 'options' issue).
 """
 
 from __future__ import annotations
 import argparse, json, os, random, math
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -47,16 +30,57 @@ import sys
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+# Feature front-end (adjust to your project structure as before)
 from core.features.feature import FeatureConfig, FeatureExtractor
 
+# ---- Metrics: try both packaged and local single-file fallbacks ------------- #
+def _try_import(default=None):
+    return default
+
+# PESQ
 try:
     from metrics.pesq import pesq_score_safe as PESQ
 except Exception:
-    PESQ = None
+    try:
+        from pesq import pesq_score_safe as PESQ          # local file fallback
+    except Exception:
+        PESQ = None
+
+# STOI
 try:
     from metrics.stoi import stoi_score_safe as STOI
 except Exception:
-    STOI = None
+    try:
+        from stoi import stoi_score_safe as STOI
+    except Exception:
+        STOI = None
+
+# SI-SDR
+try:
+    from metrics.sisdr import sisdr_np as SISDR
+except Exception:
+    try:
+        from sisdr import sisdr_np as SISDR
+    except Exception:
+        SISDR = None
+
+# DNSMOS (non-intrusive)
+try:
+    from metrics.dnsmos import dns_mos as DNSMOS
+except Exception:
+    try:
+        from dnsmos import dns_mos as DNSMOS
+    except Exception:
+        DNSMOS = None
+
+# NISQA (non-intrusive)
+try:
+    from metrics.nisqa import nisqa_mos as NISQA
+except Exception:
+    try:
+        from nisqa import nisqa_mos as NISQA
+    except Exception:
+        NISQA = None
 
 
 # ----------------------------- Utils ----------------------------------------- #
@@ -74,7 +98,7 @@ def reconstruct_from_logmel(
     noisy_wav: np.ndarray, sr: int, pred_logmel: np.ndarray,
     stft_win: int, stft_hop: int, n_fft_eff: int, fmin: float, fmax: Optional[float],
 ) -> np.ndarray:
-    """Griffin-Lim-free reconstruction: reuse noisy phase, invert Mel (pinv) to linear."""
+    """Reconstruct waveform from predicted log-Mel using noisy phase (stable, conservative)."""
     S_noisy = librosa.stft(noisy_wav, n_fft=n_fft_eff, hop_length=stft_hop,
                            win_length=stft_win, window="hann", center=False, pad_mode="constant")
     mag_noisy = np.abs(S_noisy).astype(np.float32)
@@ -89,7 +113,7 @@ def reconstruct_from_logmel(
     lin_pow_hat = np.clip(pinv @ mel_pow_hat, 0.0, None)  # [F,T]
     lin_mag_hat = np.sqrt(lin_pow_hat + 1e-9)
 
-    # Conservative cap to avoid extreme amplification (keeps artifacts down)
+    # Conservative cap to avoid extreme amplification (prevents SNR collapse)
     lin_mag_hat = np.minimum(lin_mag_hat, 2.0 * mag_noisy)
 
     S_hat = lin_mag_hat * np.exp(1j * phase_noisy)
@@ -98,7 +122,7 @@ def reconstruct_from_logmel(
     return y_hat.astype(np.float32)
 
 
-# --- Normalization helpers (SOTA-style) -------------------------------------- #
+# --- Normalization helpers --------------------------------------------------- #
 
 def load_feature_stats(stats_npz_path: Path):
     d = np.load(str(stats_npz_path))
@@ -117,7 +141,6 @@ def z_denorm_mel(mel_norm: np.ndarray, mel_mean: np.ndarray, mel_std: np.ndarray
     return mel_norm * mel_std[None, :] + mel_mean[None, :]
 
 def z_norm_f0(f0: np.ndarray, f0_mean: float, f0_std: float) -> np.ndarray:
-    # z-score only voiced frames; keep unvoiced at 0 to preserve the binary structure
     vmask = f0 > 0.0
     out = np.zeros_like(f0, dtype=np.float32)
     if np.any(vmask):
@@ -129,15 +152,9 @@ def z_norm_f0(f0: np.ndarray, f0_mean: float, f0_std: float) -> np.ndarray:
 
 class SequencePadder(tf.keras.utils.Sequence):
     """
-    Keras Sequence that:
-      - reads per-utterance noisy features from NPZ (from the manifest)
-      - computes per-utterance clean log-mel via FeatureExtractor
-      - z-normalizes inputs (Mel+F0) and targets (Mel)
-      - pads variable length to the batch max and returns sample_weight mask
-
-    Inputs X:  [B, T, D] (feats: mel(48,z-norm)+f0(z-norm)+vprob[+cepstra])
-    Targets y: [B, T, 48] (clean log-Mel, z-norm)
-    sample_weight: [B, T] mask (1.0 for valid frames, 0.0 for padding)
+    Reads per-utterance noisy features from NPZ (from the manifest),
+    computes clean log-Mel on-the-fly, z-normalizes inputs/targets,
+    returns padded batches with [B,T] sample_weight mask.
     """
     def __init__(self, rows: List[Dict[str, Any]], batch_size: int,
                  fx: FeatureExtractor,
@@ -178,19 +195,19 @@ class SequencePadder(tf.keras.utils.Sequence):
             feats = feats[:T]
             y_mel = y_mel[:T]
 
-            # --- Normalize inputs: Mel & f0 (z), keep vprob, ceps as-is
-            mel_in = feats[:, :48]                         # [T,48]
-            f0_in  = feats[:, 48:49]                       # [T,1]
-            vprob  = feats[:, 49:50]                       # [T,1]
+            # Inputs: Mel & F0 z-norm; keep vprob/cepstra as they are
+            mel_in = feats[:, :48]
+            f0_in  = feats[:, 48:49]
+            vprob  = feats[:, 49:50]
             ceps   = feats[:, 50:] if feats.shape[1] > 50 else None
 
-            mel_in = z_norm_mel(mel_in, self.mel_mean, self.mel_std)  # [T,48]
-            f0_in  = z_norm_f0(f0_in.squeeze(-1), self.f0_mean, self.f0_std)[:, None]  # [T,1]
+            mel_in = z_norm_mel(mel_in, self.mel_mean, self.mel_std)
+            f0_in  = z_norm_f0(f0_in.squeeze(-1), self.f0_mean, self.f0_std)[:, None]
 
             feats_n = np.concatenate([mel_in, f0_in, vprob], axis=-1) if ceps is None \
                       else np.concatenate([mel_in, f0_in, vprob, ceps], axis=-1)
 
-            # --- Normalize targets: Mel (z)
+            # Targets: Mel z-norm
             y_mel_n = z_norm_mel(y_mel, self.mel_mean, self.mel_std)
 
             Xs.append(feats_n)
@@ -207,7 +224,6 @@ class SequencePadder(tf.keras.utils.Sequence):
             X_pad[i, :T, :] = x
             y_pad[i, :T, :] = y
             m_pad[i, :T] = 1.0
-        # Keras expects sample_weight shape [B, T] for time-distributed losses
         return (X_pad, m_pad[..., None]), y_pad, m_pad
 
 
@@ -226,7 +242,7 @@ def get_compiled_model(input_dim: int, lr: float) -> tf.keras.Model:
         e_true = tf.reduce_sum(y_true, axis=-1)  # [B,T]
         e_pred = tf.reduce_sum(y_pred, axis=-1)  # [B,T]
         e_l1 = tf.abs(e_true - e_pred)
-        return mse + 0.02 * e_l1  # 0.01–0.05 works; 0.02 is a safe default
+        return mse + 0.02 * e_l1
 
     model.compile(
         optimizer=opt,
@@ -259,7 +275,7 @@ def main():
     fcfg = FeatureConfig(mel_ceps_keep=args.mel_ceps)
     fx = FeatureExtractor(fcfg)
 
-    # Normalization scaler (SOTA: fix stats from train set and reuse everywhere)
+    # Normalization scaler from train set
     mel_mean, mel_std, f0_mean, f0_std = load_feature_stats(args.train_stats)
 
     # Data
@@ -287,13 +303,13 @@ def main():
     model = get_compiled_model(input_dim=D, lr=args.lr)
     model.summary()
 
-    # Callbacks (save as TF SavedModel directory to avoid native .keras 'options' issue)
-    ckpt_path = args.outdir / "best_tf"  # <<< changed: directory path (SavedModel)
+    # Callbacks (SavedModel dir to avoid native .keras options issues)
+    ckpt_path = args.outdir / "best_tf"
     cbs = [
         EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1),
         ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1),
         ModelCheckpoint(
-            filepath=str(ckpt_path),        # <<< changed: use 'filepath' to a directory
+            filepath=str(ckpt_path),        # directory (SavedModel)
             monitor="val_loss",
             save_best_only=True,
             save_weights_only=False,
@@ -302,7 +318,7 @@ def main():
         CSVLogger(str(args.outdir / "history.csv")),
     ]
 
-    # >>>>>>>>>>>>>>>>>> TRAIN (sample_weight from sequence) <<<<<<<<<<<<<< #
+    # Train
     history = model.fit(
         train_seq,
         validation_data=val_seq,
@@ -310,14 +326,14 @@ def main():
         callbacks=cbs,
         verbose=1,
     )
-    # Save history
+
+    # Save history JSON
     hist_dict = {k: [float(x) for x in v] for k, v in history.history.items()}
     with open(args.outdir / "history.json", "w") as f:
         json.dump(hist_dict, f, indent=2)
 
     # ------------------------ Evaluate & dump wavs ---------------------------- #
     def build_normalized_input_from_npz(npz_path: str) -> np.ndarray:
-        """Load cached feats and return normalized feature tensor [T,D] for inference."""
         d = np.load(npz_path, allow_pickle=False)
         feats = d["feats"].astype(np.float32)  # [T,D]
         mel_in = feats[:, :48]
@@ -336,7 +352,9 @@ def main():
     stft_win, stft_hop = fcfg.win_length, fcfg.hop_length
     n_fft_eff = max(fcfg.n_fft, fcfg.win_length)
 
-    pesq_list, stoi_list, snr_in_list, snr_out_list = [], [], [], []
+    pesq_list, stoi_list, sisdr_list = [], [], []
+    snr_in_list, snr_out_list = [], []
+    dnsmos_sig, dnsmos_bak, dnsmos_ovr, nisqa_list = [], [], [], []
 
     for j, row in enumerate(tqdm(test_rows, desc="Render test samples")):
         npz_path = row["npz"]
@@ -362,24 +380,50 @@ def main():
         sf.write(str(base.with_suffix(".clean.wav")), clean_wav, sr)
         sf.write(str(base.with_suffix(".enh.wav")),   enh_wav,   sr)
 
+        # Intrusive metrics
         def snr(ref, est, eps=1e-9):
             num = np.sum(ref**2); den = np.sum((ref - est)**2) + eps
             return 10.0 * np.log10((num + eps) / den)
         snr_in_list.append(float(snr(clean_wav, noisy_wav)))
         snr_out_list.append(float(snr(clean_wav, enh_wav)))
 
+        if SISDR is not None:
+            try: sisdr_list.append(float(SISDR(clean_wav, enh_wav)))
+            except Exception: pass
+
         if PESQ is not None:
             try: pesq_list.append(float(PESQ(clean_wav, enh_wav, sr)))
             except Exception: pass
+
         if STOI is not None:
             try: stoi_list.append(float(STOI(clean_wav, enh_wav, sr)))
             except Exception: pass
 
+        # Non-intrusive metrics (reference-free)
+        if DNSMOS is not None:
+            try:
+                dns = DNSMOS(enh_wav, sr)  # dict with SIG/BAK/OVR
+                dnsmos_sig.append(float(dns.get("SIG", 0.0)))
+                dnsmos_bak.append(float(dns.get("BAK", 0.0)))
+                dnsmos_ovr.append(float(dns.get("OVR", 0.0)))
+            except Exception:
+                pass
+
+        if NISQA is not None:
+            try: nisqa_list.append(float(NISQA(enh_wav, sr)))
+            except Exception: pass
+
+    # Aggregate
     metrics["snr_in_mean"]  = float(np.mean(snr_in_list)) if snr_in_list else None
     metrics["snr_out_mean"] = float(np.mean(snr_out_list)) if snr_out_list else None
     metrics["snr_delta"]    = (metrics["snr_out_mean"] - metrics["snr_in_mean"]) if (metrics["snr_in_mean"] is not None and metrics["snr_out_mean"] is not None) else None
-    if pesq_list: metrics["pesq_mean"] = float(np.mean(pesq_list))
-    if stoi_list: metrics["stoi_mean"] = float(np.mean(stoi_list))
+    if sisdr_list: metrics["sisdr_mean"] = float(np.mean(sisdr_list))
+    if pesq_list:  metrics["pesq_mean"]  = float(np.mean(pesq_list))
+    if stoi_list:  metrics["stoi_mean"]  = float(np.mean(stoi_list))
+    if dnsmos_sig: metrics["dnsmos_sig_mean"] = float(np.mean(dnsmos_sig))
+    if dnsmos_bak: metrics["dnsmos_bak_mean"] = float(np.mean(dnsmos_bak))
+    if dnsmos_ovr: metrics["dnsmos_ovr_mean"] = float(np.mean(dnsmos_ovr))
+    if nisqa_list: metrics["nisqa_mos_mean"]   = float(np.mean(nisqa_list))
 
     with open(args.outdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
