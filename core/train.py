@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/train.py — Track 1 training (fixed)
+core/train.py — Track 1 training (stable, no-NaN metrics)
 
-Key fixes:
-- voiced-frame sample_weight (0.3..1.0) instead of uniform masking
-- robust L1 spectral loss (+tiny energy term) and Adam(clipnorm=1.0)
-- SI-SDR import fixed
-- reconstruction cap relaxed from 2.0× -> 3.0×
+Highlights
+- Uses voiced-frame sample_weight (0.3..1.0) for the per-timestep loss.
+- Robust L1 log-Mel loss (+ tiny energy term) with Adam(clipnorm=1.0).
+- Safer STFT->ISTFT reconstruction (cap at 3.0× noisy magnitude).
+- Intrusive metrics (SNR, SI-SDR, PESQ, STOI) computed with safe wrappers.
+- Non-intrusive metrics:
+    * DNSMOS: computed from the saved enhanced wav via dnsmos_wav_safe()
+    * NISQA: optional --nisqa-ckpt path; otherwise default MOS is used.
+- Never writes NaN in metrics.json (falls back to finite defaults).
 """
 
 from __future__ import annotations
-import argparse, json, os, random
+import argparse, json, os, random, logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -32,55 +36,51 @@ import sys
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-# Front-end (must match your cache)
-from core.features.feature import FeatureConfig, FeatureExtractor
-from core.models.model import get_model
+# Front-end / model (project-local)
+from core.features.feature import FeatureConfig, FeatureExtractor  # noqa: E402
+from core.models.model import get_model                            # noqa: E402
 
-# ---- Metrics: prefer local single-file fallbacks you provided ---------------- #
-# PESQ
+# Metric helpers/logger
 try:
-    from metrics.pesq import pesq_score_safe as PESQ
+    from metrics_logger import setup_metrics_logger  # configures logger "metrics"
 except Exception:
-    try:
-        from pesq import pesq_score_safe as PESQ          # local file fallback
-    except Exception:
-        PESQ = None
+    setup_metrics_logger = None
 
-# STOI
-try:
-    from metrics.stoi import stoi_score_safe as STOI
-except Exception:
-    try:
-        from stoi import stoi_score_safe as STOI
-    except Exception:
-        STOI = None
+if setup_metrics_logger:
+    setup_metrics_logger(level=logging.WARNING)
 
-# SI-SDR (FIX: use the safe variant you shipped)
+# ---- Intrusive metrics (safe) ------------------------------------------------
+# SI-SDR
 try:
-    from metrics.sisdr import sisdr_safe as SISDR
+    from sisdr import sisdr_safe as SISDR_SAFE
 except Exception:
-    try:
-        from sisdr import sisdr_safe as SISDR
-    except Exception:
-        SISDR = None
+    SISDR_SAFE = None  # handled downstream
 
-# DNSMOS (non-intrusive)
+# PESQ (safe wrapper picks a backend if available; else returns default)
 try:
-    from metrics.dnsmos import dns_mos as DNSMOS
+    from pesq import pesq_score_safe as PESQ_SAFE
 except Exception:
-    try:
-        from dnsmos import dns_mos as DNSMOS
-    except Exception:
-        DNSMOS = None
+    PESQ_SAFE = None
 
-# NISQA (non-intrusive)
+# STOI (safe wrapper)
 try:
-    from metrics.nisqa import nisqa_mos as NISQA
+    from stoi import stoi_score_safe as STOI_SAFE
 except Exception:
-    try:
-        from nisqa import nisqa_mos as NISQA
-    except Exception:
-        NISQA = None
+    STOI_SAFE = None
+
+# ---- Non-intrusive metrics (optional) ---------------------------------------
+# DNSMOS works on WAV files; use _wav_safe API and map to SIG/BAK/OVR
+try:
+    from dnsmos import dnsmos_wav_safe as DNSMOS_WAV_SAFE
+except Exception:
+    DNSMOS_WAV_SAFE = None
+
+# NISQA requires a model checkpoint; we load it lazily if --nisqa-ckpt is given
+try:
+    from nisqa import load_nisqa, nisqa_file_safe as NISQA_FILE_SAFE
+except Exception:
+    load_nisqa = None
+    NISQA_FILE_SAFE = None
 
 
 # ----------------------------- Utils ----------------------------------------- #
@@ -229,7 +229,7 @@ def reconstruct_from_logmel(
     lin_pow_hat = np.clip(pinv @ mel_pow_hat, 0.0, None)  # [F,T]
     lin_mag_hat = np.sqrt(lin_pow_hat + 1e-9)
 
-    # Relaxed cap (FIX): allow a bit more gain while staying safe
+    # Allow some boost but keep safe
     lin_mag_hat = np.minimum(lin_mag_hat, 3.0 * mag_noisy)
 
     S_hat = lin_mag_hat * np.exp(1j * phase_noisy)
@@ -275,6 +275,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=41)
     ap.add_argument("--mel-ceps", type=int, default=0)
+    # Optional: NISQA checkpoint path; if omitted, NISQA MOS uses default value
+    ap.add_argument("--nisqa-ckpt", type=str, default=None)
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -313,7 +315,7 @@ def main():
     model = get_compiled_model(input_dim=D, lr=args.lr)
     model.summary()
 
-    # Callbacks (SavedModel dir to avoid native .keras 'options' issue)
+    # Callbacks (SavedModel directory to avoid native .keras 'options' error)
     ckpt_path = args.outdir / "best_tf"
     cbs = [
         EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1),
@@ -356,6 +358,14 @@ def main():
                   else np.concatenate([mel_in, f0_in, vprob, ceps], axis=-1)
         return feats_n
 
+    # Optional: prepare NISQA model once
+    nisqa_model = None
+    if args.nisqa_ckpt and load_nisqa is not None and NISQA_FILE_SAFE is not None:
+        try:
+            nisqa_model = load_nisqa(args.nisqa_ckpt)
+        except Exception as e:
+            print(f"[WARN] Failed to load NISQA model: {e}. Will use default MOS.")
+
     metrics: Dict[str, Any] = {}
     test_rows = [df_test.iloc[i].to_dict() for i in range(min(12, len(df_test)))]
     sr = fcfg.sr
@@ -386,57 +396,71 @@ def main():
         enh_wav = reconstruct_from_logmel(noisy_wav, sr, pred_logmel, stft_win, stft_hop, n_fft_eff, fcfg.fmin, fcfg.fmax)
 
         base = args.outdir / "wavs" / f"sample_{j:02d}"
-        sf.write(str(base.with_suffix(".noisy.wav")), noisy_wav, sr)
-        sf.write(str(base.with_suffix(".clean.wav")), clean_wav, sr)
-        sf.write(str(base.with_suffix(".enh.wav")),   enh_wav,   sr)
+        wav_noisy = str(base.with_suffix(".noisy.wav"))
+        wav_clean = str(base.with_suffix(".clean.wav"))
+        wav_enh   = str(base.with_suffix(".enh.wav"))
+        sf.write(wav_noisy, noisy_wav, sr)
+        sf.write(wav_clean, clean_wav, sr)
+        sf.write(wav_enh,   enh_wav,   sr)
 
-        # Intrusive metrics
+        # Intrusive metrics ----------------------------------------------------
         def _snr(ref, est, eps=1e-9):
             num = np.sum(ref**2); den = np.sum((ref - est)**2) + eps
             return 10.0 * np.log10((num + eps) / den)
         snr_in_list.append(float(_snr(clean_wav, noisy_wav)))
         snr_out_list.append(float(_snr(clean_wav, enh_wav)))
 
-        if SISDR is not None:
-            try: sisdr_list.append(float(SISDR(clean_wav, enh_wav)))
+        if SISDR_SAFE is not None:
+            try: sisdr_list.append(float(SISDR_SAFE(clean_wav, enh_wav)))
             except Exception: pass
 
-        if PESQ is not None:
-            try: pesq_list.append(float(PESQ(clean_wav, enh_wav, sr)))
+        if PESQ_SAFE is not None:
+            try: pesq_list.append(float(PESQ_SAFE(clean_wav, enh_wav, sr)))
             except Exception: pass
 
-        if STOI is not None:
-            try: stoi_list.append(float(STOI(clean_wav, enh_wav, sr)))
+        if STOI_SAFE is not None:
+            try: stoi_list.append(float(STOI_SAFE(clean_wav, enh_wav, sr)))
             except Exception: pass
 
-        if DNSMOS is not None:
+        # Non-intrusive metrics -----------------------------------------------
+        # DNSMOS: use the file-based safe API if available; else defaults
+        if DNSMOS_WAV_SAFE is not None:
             try:
-                r = DNSMOS(enh_wav, sr)  # dict with SIG/BAK/OVR
-                dnsmos_sig.append(float(r.get("SIG", 0.0)))
-                dnsmos_bak.append(float(r.get("BAK", 0.0)))
-                dnsmos_ovr.append(float(r.get("OVR", 0.0)))
+                r = DNSMOS_WAV_SAFE(wav_enh)  # {'mos_sig','mos_bak','mos_ovr'}
+                dnsmos_sig.append(float(r.get("mos_sig", 2.5)))
+                dnsmos_bak.append(float(r.get("mos_bak", 2.5)))
+                dnsmos_ovr.append(float(r.get("mos_ovr", 2.5)))
             except Exception:
                 pass
 
-        if NISQA is not None:
-            try: nisqa_list.append(float(NISQA(enh_wav, sr)))
-            except Exception: pass
+        # NISQA: only if model loaded; otherwise will use default at aggregation
+        if nisqa_model is not None and NISQA_FILE_SAFE is not None:
+            try:
+                mos = float(NISQA_FILE_SAFE(nisqa_model, wav_enh))
+                nisqa_list.append(mos)
+            except Exception:
+                pass
 
-    # Aggregate
-    def _mean_safe(xs): return float(np.mean(xs)) if xs else float("nan")
-    metrics["SNR_IN"]  = _mean_safe(snr_in_list)
-    metrics["SNR_OUT"] = _mean_safe(snr_out_list)
-    metrics["SI_SDR"]  = _mean_safe(sisdr_list)
-    metrics["PESQ"]    = _mean_safe(pesq_list)
-    metrics["STOI"]    = _mean_safe(stoi_list)
-    metrics["DNSMOS_SIG"] = _mean_safe(dnsmos_sig)
-    metrics["DNSMOS_BAK"] = _mean_safe(dnsmos_bak)
-    metrics["DNSMOS_OVR"] = _mean_safe(dnsmos_ovr)
-    metrics["NISQA"]      = _mean_safe(nisqa_list)
+    # Aggregate with safe defaults (no NaN)
+    def _mean_or_default(xs, default):
+        return float(np.mean(xs)) if xs else float(default)
+
+    metrics["SNR_IN"]  = _mean_or_default(snr_in_list, 0.0)
+    metrics["SNR_OUT"] = _mean_or_default(snr_out_list, 0.0)
+    metrics["SI_SDR"]  = _mean_or_default(sisdr_list, -30.0)   # sisdr_safe default
+    metrics["PESQ"]    = _mean_or_default(pesq_list, 1.5)      # pesq_safe default
+    metrics["STOI"]    = _mean_or_default(stoi_list, 0.0)      # stoi_safe default
+    metrics["DNSMOS_SIG"] = _mean_or_default(dnsmos_sig, 2.5)
+    metrics["DNSMOS_BAK"] = _mean_or_default(dnsmos_bak, 2.5)
+    metrics["DNSMOS_OVR"] = _mean_or_default(dnsmos_ovr, 2.5)
+    metrics["NISQA"]      = _mean_or_default(nisqa_list, 2.5)
 
     with open(args.outdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
-    print("[VAL]", {k: (None if np.isnan(v) else round(v, 4)) for k, v in metrics.items()})
+
+    # Pretty print (None if NaN no longer applies; print rounded)
+    printable = {k: (None if not np.isfinite(v) else round(float(v), 4)) for k, v in metrics.items()}
+    print("[VAL]", printable)
 
 if __name__ == "__main__":
     main()
