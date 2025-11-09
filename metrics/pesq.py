@@ -1,95 +1,18 @@
+# pesq.py — STRICT
 from __future__ import annotations
-import sys
-import importlib
 import numpy as np
 
-from .metrics_utils import to_mono, align, finite_or_default, clamp, LOG
-from core.data.resample_audio import resample_audio
-
-# Try to obtain a real PESQ backend without shadowing ourselves.
-_pesq_func = None
-_IMPORT_ERR = None
-
-def _load_pesq_backend():
-    global _pesq_func, _IMPORT_ERR
-    try:
-        pkg = importlib.import_module("pesq")
-        # If pkg is THIS module (shadowed), force an ImportError to try fallback
-        if pkg is sys.modules.get(__name__):
-            raise ImportError("Local module 'pesq.py' shadows the third-party 'pesq' package.")
-        if hasattr(pkg, "pesq"):
-            _pesq_func = pkg.pesq
-            return
-    except Exception as e:
-        _IMPORT_ERR = e
-
-    # Fallback: pypesq (wideband only; not bit-exact ITU but better than nothing)
-    try:
-        import pypesq
-        def _pypesq_wrapper(sr, ref, deg, mode):
-            # pypesq signature: pypesq.pesq(ref, deg, sr)
-            return float(pypesq.pesq(ref, deg, sr))
-        _pesq_func = _pypesq_wrapper
-        return
-    except Exception as e2:
-        _IMPORT_ERR = Exception(f"{_IMPORT_ERR}; fallback pypesq failed: {e2}")
-
-_load_pesq_backend()
-
-def _auto_mode(sr: int) -> str:
-    # ITU PESQ supports nb(8k) and wb(16k). We'll use nb at 8k, wb otherwise.
-    return "nb" if sr <= 8000 else "wb"
+try:
+    from pesq import pesq as _pesq
+except Exception as e:
+    raise ImportError("The 'pesq' package (ITU-T P.862) is required.") from e
 
 def pesq_score(ref: np.ndarray, deg: np.ndarray, sr: int) -> float:
-    """
-    Compute PESQ between reference (clean) and degraded/enhanced.
-    - sr: 8000→'nb', >=16000→'wb' (auto)
-    Signals must be mono, same length, float. This function raises on error.
-    """
-    if _pesq_func is None:
-        raise ImportError(
-            "No PESQ backend available. Install 'pesq' (preferred) or 'pypesq'."
-        ) from _IMPORT_ERR
-
-    if not isinstance(ref, np.ndarray) or not isinstance(deg, np.ndarray):
-        raise TypeError("ref/deg must be numpy arrays")
-    if sr <= 0:
-        raise ValueError("sr must be positive")
-
-    ref = ref.astype(np.float32).ravel()
-    deg = deg.astype(np.float32).ravel()
-    ref, deg = align(ref, deg)
-    if len(ref) == 0:
-        raise ValueError("Empty input")
-
-    mode = _auto_mode(sr)
-    return float(_pesq_func(sr, ref, deg, mode))
-
-def pesq_score_safe(
-    ref, deg, sr, default: float = 1.5, auto_resample: bool = True
-) -> float:
-    """
-    Training-safe PESQ:
-      * folds to mono, aligns, optional auto-resample to 8k/16k
-      * clamps to legal range [-0.5, 4.5]
-      * never returns NaN/Inf; returns default on failure
-    """
-    try:
-        ref = to_mono(ref)
-        deg = to_mono(deg)
-        ref, deg = align(ref, deg)
-        if len(ref) == 0:
-            raise ValueError("Empty input")
-
-        # Resample to supported rates for the standard backend
-        target_sr = 16000 if sr >= 12000 else 8000
-        if auto_resample and sr not in (8000, 16000):
-            ref = resample_audio(ref, sr, target_sr)
-            deg = resample_audio(deg, sr, target_sr)
-            sr = target_sr
-
-        val = pesq_score(ref, deg, sr)
-        return clamp(finite_or_default(val, default, "PESQ"), -0.5, 4.5)
-    except Exception as e:
-        LOG.warning("PESQ failed (sr=%s): %s. Using default=%s.", sr, e, default)
-        return float(default)
+    if ref.ndim != 1 or deg.ndim != 1:
+        raise ValueError("pesq_score expects 1D mono arrays.")
+    if sr not in (8000, 16000):
+        raise ValueError("PESQ supports only 8000 or 16000 Hz.")
+    score = float(_pesq(sr, ref.astype(np.float32), deg.astype(np.float32), 'wb' if sr == 16000 else 'nb'))
+    if not (score == score):
+        raise ValueError("PESQ returned NaN.")
+    return score
