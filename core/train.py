@@ -305,13 +305,53 @@ def get_compiled_model(input_dim: int, lr: float) -> tf.keras.Model:
 
     opt = tf.keras.optimizers.Adam(learning_rate=float(lr), clipnorm=1.0)
 
-    # Per-frame loss; sample_weight [B,T] applied by Keras from the Sequence
+    # Loss mixt: L1 pe log-Mel + termeni "spectrali" în stil STFT-loss
     def masked_loss(y_true, y_pred):
-        l1  = tf.reduce_mean(tf.abs(y_true - y_pred), axis=-1)  # [B,T]
-        e_true = tf.reduce_sum(y_true, axis=-1)                 # [B,T]
-        e_pred = tf.reduce_sum(y_pred, axis=-1)                 # [B,T]
-        e_l1 = tf.abs(e_true - e_pred)
-        return l1 + 0.02 * e_l1
+        """
+        y_true, y_pred: [B, T, 48] (log-Mel NORMALIZAT, dar e ok; scale-ul e relativ)
+        Return: [B, T] loss per-frame, Keras aplică sample_weight din SequencePadder.
+        """
+
+        # 1) L1 clasic pe log-Mel (ca înainte)
+        l1 = tf.reduce_mean(tf.abs(y_true - y_pred), axis=-1)  # [B, T]
+
+        # 2) Approx "power" din log-Mel (nu e 100% fizic corect, dar suficient ca formă)
+        #    treatăm y_* ca log-power; chiar dacă e z-normed, exp() pune accent pe benzi energice
+        p_true = tf.exp(y_true)
+        p_pred = tf.exp(y_pred)
+
+        # 3) Spectral convergence (tipic în multi-res STFT loss)
+        #    sc = ||P_true - P_pred|| / (||P_true|| + eps)
+        #    agregăm pe frecvență (axis=-1), rămâne [B, T]
+        num = tf.norm(p_true - p_pred, ord='euclidean', axis=-1)
+        den = tf.norm(p_true,          ord='euclidean', axis=-1) + 1e-8
+        l_sc = num / den  # [B, T]
+
+        # 4) Log-magnitude loss (tot ceva de tip "perceptual")
+        #    log_mag_true = log(p_true + eps), la fel pentru pred.
+        #    asta penalizează mai tare diferențele în benzi cu energie mare.
+        log_mag_true = tf.math.log(p_true + 1e-8)
+        log_mag_pred = tf.math.log(p_pred + 1e-8)
+        l_logmag = tf.reduce_mean(tf.abs(log_mag_true - log_mag_pred), axis=-1)  # [B,T]
+
+        # 5) Termenul tău de energie (păstrat, doar coeficientul poate fi ajustat)
+        e_true = tf.reduce_sum(y_true, axis=-1)  # [B, T]
+        e_pred = tf.reduce_sum(y_pred, axis=-1)  # [B, T]
+        e_l1 = tf.abs(e_true - e_pred)           # [B, T]
+
+        # 6) Combinația finală (hiperparametri "perceptuali")
+        #    - 1.0 * L1 log-Mel  (stabilizează training-ul)
+        #    - 0.3 * log-mag     (accent pe zonele energice)
+        #    - 0.3 * spec. conv. (forme spectrale globale)
+        #    - 0.02 * energy     (ca înainte)
+        loss = (
+            l1
+            + 0.3 * l_logmag
+            + 0.3 * l_sc
+            + 0.02 * e_l1
+        )  # [B, T]
+
+        return loss
 
     model.compile(
         optimizer=opt,
@@ -319,7 +359,6 @@ def get_compiled_model(input_dim: int, lr: float) -> tf.keras.Model:
         metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
     )
     return model
-
 
 # -------------------------------- Main --------------------------------------- #
 
