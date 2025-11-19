@@ -300,56 +300,82 @@ def reconstruct_from_logmel_strict(
 
 # ----------------------------- Model / loss ---------------------------------- #
 
-def get_compiled_model(input_dim: int, lr: float) -> tf.keras.Model:
+def get_compiled_model(
+    input_dim: int,
+    lr: float,
+    mel_mean: np.ndarray,
+    mel_std: np.ndarray,
+    log_base: str,
+    log_eps: float,
+) -> tf.keras.Model:
+    """
+    Build and compile model with a mixed loss:
+    - L1 on z-normalized log-Mel (stabilizing term)
+    - spectral convergence and log-magnitude in true Mel-power domain
+    - small energy consistency term
+    """
     model = get_model(input_dim=input_dim)
 
     opt = tf.keras.optimizers.Adam(learning_rate=float(lr), clipnorm=1.0)
 
-    # Loss mixt: L1 pe log-Mel + termeni "spectrali" în stil STFT-loss
+    # Convert stats & params to TF constants for use in the loss
+    mel_mean_tf = tf.constant(mel_mean.reshape(1, 1, -1), dtype=tf.float32)  # [1,1,48]
+    mel_std_tf  = tf.constant(mel_std.reshape(1, 1, -1),  dtype=tf.float32)  # [1,1,48]
+    log_eps_tf  = tf.constant(float(log_eps), dtype=tf.float32)
+
+    use_ln = (log_base.lower() in ("ln", "e", "natural"))
+
+    # Loss mixt: L1 (z-norm) + spectral convergence + log-mag + energy, toate în domeniul corect
     def masked_loss(y_true, y_pred):
         """
-        y_true, y_pred: [B, T, 48] (log-Mel NORMALIZAT, dar e ok; scale-ul e relativ)
-        Return: [B, T] loss per-frame, Keras aplică sample_weight din SequencePadder.
+        y_true, y_pred: [B, T, 48] log-Mel NORMALIZAT (z-norm).
+        Return: [B, T] loss per-frame; Keras folosește sample_weight din SequencePadder.
         """
 
-        # 1) L1 clasic pe log-Mel (ca înainte)
-        l1 = tf.reduce_mean(tf.abs(y_true - y_pred), axis=-1)  # [B, T]
+        # 0) De-normalizăm la log-Mel real
+        logmel_true = y_true * mel_std_tf + mel_mean_tf   # [B,T,48]
+        logmel_pred = y_pred * mel_std_tf + mel_mean_tf   # [B,T,48]
 
-        # 2) Approx "power" din log-Mel (nu e 100% fizic corect, dar suficient ca formă)
-        #    treatăm y_* ca log-power; chiar dacă e z-normed, exp() pune accent pe benzi energice
-        p_true = tf.exp(y_true)
-        p_pred = tf.exp(y_pred)
+        # 1) L1 pe log-Mel NORMALIZAT (stabilizator)
+        l1 = tf.reduce_mean(tf.abs(y_true - y_pred), axis=-1)  # [B,T]
 
-        # 3) Spectral convergence (tipic în multi-res STFT loss)
-        #    sc = ||P_true - P_pred|| / (||P_true|| + eps)
-        #    agregăm pe frecvență (axis=-1), rămâne [B, T]
-        num = tf.norm(p_true - p_pred, ord='euclidean', axis=-1)
-        den = tf.norm(p_true,          ord='euclidean', axis=-1) + 1e-8
-        l_sc = num / den  # [B, T]
+        # 2) Convertim log-Mel -> Mel-power în același mod ca la reconstrucție
+        if use_ln:
+            mel_pow_true = tf.exp(logmel_true) - log_eps_tf
+            mel_pow_pred = tf.exp(logmel_pred) - log_eps_tf
+        else:
+            mel_pow_true = tf.pow(10.0, logmel_true) - log_eps_tf
+            mel_pow_pred = tf.pow(10.0, logmel_pred) - log_eps_tf
 
-        # 4) Log-magnitude loss (tot ceva de tip "perceptual")
-        #    log_mag_true = log(p_true + eps), la fel pentru pred.
-        #    asta penalizează mai tare diferențele în benzi cu energie mare.
-        log_mag_true = tf.math.log(p_true + 1e-8)
-        log_mag_pred = tf.math.log(p_pred + 1e-8)
+        mel_pow_true = tf.nn.relu(mel_pow_true)
+        mel_pow_pred = tf.nn.relu(mel_pow_pred)
+
+        # 3) Spectral convergence în Mel-power
+        #    sc = ||P_true - P_pred|| / (||P_true|| + eps), agregat pe frecvență
+        num = tf.norm(mel_pow_true - mel_pow_pred, ord='euclidean', axis=-1)  # [B,T]
+        den = tf.norm(mel_pow_true,              ord='euclidean', axis=-1) + 1e-8
+        l_sc = num / den  # [B,T]
+
+        # 4) Log-magnitude loss în Mel-power
+        log_mag_true = tf.math.log(mel_pow_true + 1e-8)
+        log_mag_pred = tf.math.log(mel_pow_pred + 1e-8)
         l_logmag = tf.reduce_mean(tf.abs(log_mag_true - log_mag_pred), axis=-1)  # [B,T]
 
-        # 5) Termenul tău de energie (păstrat, doar coeficientul poate fi ajustat)
-        e_true = tf.reduce_sum(y_true, axis=-1)  # [B, T]
-        e_pred = tf.reduce_sum(y_pred, axis=-1)  # [B, T]
-        e_l1 = tf.abs(e_true - e_pred)           # [B, T]
+        # 5) Termen de energie (pe log-Mel real)
+        e_true = tf.reduce_sum(logmel_true, axis=-1)  # [B, T]
+        e_pred = tf.reduce_sum(logmel_pred, axis=-1)  # [B, T]
+        e_l1 = tf.abs(e_true - e_pred)
 
-        # 6) Combinația finală (hiperparametri "perceptuali")
-        #    - 1.0 * L1 log-Mel  (stabilizează training-ul)
-        #    - 0.3 * log-mag     (accent pe zonele energice)
-        #    - 0.3 * spec. conv. (forme spectrale globale)
-        #    - 0.02 * energy     (ca înainte)
+        # 6) Combinația finală
+        #    - 0.5 * log-mag + 0.5 * sc: termeni “perceptuali” principali
+        #    - 0.2 * L1 z-norm: stabilizare
+        #    - 0.01 * energy: mic, doar pentru consistență de energie
         loss = (
-            l1
-            + 0.3 * l_logmag
-            + 0.3 * l_sc
-            + 0.02 * e_l1
-        )  # [B, T]
+            0.2 * l1
+            + 0.5 * l_logmag
+            + 0.5 * l_sc
+            + 0.01 * e_l1
+        )
 
         return loss
 
@@ -359,6 +385,7 @@ def get_compiled_model(input_dim: int, lr: float) -> tf.keras.Model:
         metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
     )
     return model
+
 
 # -------------------------------- Main --------------------------------------- #
 
@@ -450,7 +477,14 @@ def main():
     D = int(sample_npz["feats"].shape[-1])
     if D < 50:
         raise ValueError(f"Model input dim must be >=50, got {D}")
-    model = get_compiled_model(input_dim=D, lr=args.lr)
+    model = get_compiled_model(
+        input_dim=D,
+        lr=args.lr,
+        mel_mean=mel_mean,
+        mel_std=mel_std,
+        log_base=log_base,
+        log_eps=log_eps,
+    )
     model.summary()
 
     # ---- Callbacks ----
