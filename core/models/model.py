@@ -171,8 +171,17 @@ def get_model(input_dim: int,
     mel_log = L.Lambda(lambda z: z[:, :, :48], name="slice_mel")(xin)   # [B, T, 48]
     aux     = L.Lambda(lambda z: z[:, :, 48:], name="slice_aux")(xin)   # [B, T, D-48]
 
+    # -------------------------- Mel multi-branch front-end -------------------- #
+    # Multi-scale causal convs over mel to enrich short/medium/long contexts.
+    m1 = L.Conv1D(32, kernel_size=3, padding="causal", activation="swish", name="mel_br_k3")(mel_log)
+    m2 = L.Conv1D(32, kernel_size=7, padding="causal", activation="swish", name="mel_br_k7")(mel_log)
+    m3 = L.Conv1D(32, kernel_size=15, padding="causal", activation="swish", name="mel_br_k15")(mel_log)
+    mel_multi = L.Concatenate(name="mel_multi")([mel_log, m1, m2, m3])
+    mel_multi = _layer_norm(mel_multi, "mel_multi_ln")
+
     # -------------------------- Pre-net (input projection) -------------------- #
-    h = L.Dense(hidden, activation="swish", name="in_proj")(xin)        # [B, T, H]
+    x_in = L.Concatenate(name="in_concat")([mel_multi, aux])
+    h = L.Dense(hidden, activation="swish", name="in_proj")(x_in)       # [B, T, H]
     h = _layer_norm(h, "in_ln")
 
     # -------------------------- Hybrid GRU + TCN backbone --------------------- #
