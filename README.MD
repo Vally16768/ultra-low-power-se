@@ -39,4 +39,5 @@ nohup python -m core.train \
 
 echo $! > runs/exp_mask_df_v4/train.pid
 
+I change from self attention layers to latent attention layer
 
