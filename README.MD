@@ -21,13 +21,13 @@ python core/features/create_training_data.py \
   --subset-name test \
   --jobs 25
 
-mkdir -p runs/exp_mask_df_v4
+mkdir -p runs/exp_mask_df_v1_nora
 
 nohup python -m core.train \
   --train-manifest runs/feat_cache/train_manifest.csv \
   --test-manifest  runs/feat_cache/test_manifest.csv \
   --train-stats    runs/feat_cache/train_feature_stats.npz \
-  --outdir         runs/exp_mask_df_v4 \
+  --outdir         runs/exp_mask_df_v1_nora \
   --batch-size 32 \
   --epochs 1 \
   --lr 1e-3 \
@@ -35,9 +35,9 @@ nohup python -m core.train \
   --log-base ln \
   --log-eps 1e-6 \
   --peak-target 0.95 \
-  > runs/exp_mask_df_v4/train.log 2>&1 &
+  > runs/exp_mask_df_v1_nora/train.log 2>&1 &
 
-echo $! > runs/exp_mask_df_v4/train.pid
+echo $! > runs/exp_mask_df_v1_nora/train.pid
 
 I change from self attention layers to latent attention layer
 

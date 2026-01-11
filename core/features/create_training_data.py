@@ -94,11 +94,37 @@ def read_pairs(csv_path: Path) -> List[Tuple[int, str, str]]:
     return rows
 
 
+def _strip_overlapping_prefix(base: Path, rel: Path) -> Optional[Path]:
+    """
+    If rel starts with a suffix of base, strip that prefix from rel.
+    This avoids base duplication like:
+      base=/a/b/datasets/voicebank/16k
+      rel =datasets/voicebank/16k/noisy_test/...
+    """
+    base_parts = base.parts
+    rel_parts = rel.parts
+    max_k = min(len(base_parts), len(rel_parts))
+    for k in range(max_k, 0, -1):
+        if base_parts[-k:] == rel_parts[:k]:
+            return Path(*rel_parts[k:]) if k < len(rel_parts) else Path()
+    return None
+
+
 def ensure_abs(path_str: str, base: Optional[Path]) -> str:
     p = Path(path_str)
     if p.is_absolute():
         return str(p)
-    return str((base / p).resolve() if base else p.resolve())
+    if base:
+        candidate = (base / p).resolve()
+        if candidate.exists():
+            return str(candidate)
+        trimmed = _strip_overlapping_prefix(base, p)
+        if trimmed is not None:
+            candidate = (base / trimmed).resolve()
+            if candidate.exists():
+                return str(candidate)
+        return str(candidate)
+    return str(p.resolve())
 
 
 # ----------------------------- Worker ---------------------------------------- #
