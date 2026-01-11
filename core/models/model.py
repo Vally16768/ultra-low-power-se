@@ -199,18 +199,16 @@ def get_model(input_dim: int,
     # -------------------------- Output projection ----------------------------- #
     logmel_hat = _layer_norm(logmel_hat, "out_ln")
     logmel_hat = L.Dense(48, activation=None, name="out_proj")(logmel_hat)
+    # Keep time_mask connected to the graph (no-op) to satisfy Functional API.
+    logmel_hat = L.Lambda(
+        lambda t: t[0] + 0.0 * t[1],
+        name="connect_time_mask"
+    )([logmel_hat, xmsk])
 
     model = tf.keras.Model(
         inputs=[xin, xmsk],
         outputs=logmel_hat,
         name="track1_big_mask_df"
     )
-
-    # Track the magnitude of Mel edits (for monitoring)
-    delta_abs_mean = L.Lambda(
-        lambda d: tf.reduce_mean(tf.abs(d)),
-        name="delta_abs_mean_tensor"
-    )(delta)
-    model.add_metric(delta_abs_mean, name="delta_abs_mean", aggregation="mean")
 
     return model
