@@ -98,6 +98,55 @@ def _tcn_block(x: tf.Tensor, channels: int, kernel_size: int, dilation: int,
     return out
 
 
+class _LatentAttention(L.Layer):
+    """Perceiver-style latent attention: latents attend to input, then input attends to latents."""
+    def __init__(self, num_latents: int, dim: int, num_heads: int, dropout: float, name: str):
+        super().__init__(name=name)
+        self.num_latents = int(num_latents)
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.dropout = float(dropout)
+
+        self.cross_in = L.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.dim // self.num_heads,
+            dropout=self.dropout,
+            name=f"{name}_cross_in",
+        )
+        self.cross_out = L.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.dim // self.num_heads,
+            dropout=self.dropout,
+            name=f"{name}_cross_out",
+        )
+        self.ln_in = L.LayerNormalization(epsilon=1e-5, name=f"{name}_ln_in")
+        self.ln_out = L.LayerNormalization(epsilon=1e-5, name=f"{name}_ln_out")
+
+    def build(self, input_shape):
+        self.latents = self.add_weight(
+            name="latents",
+            shape=(self.num_latents, self.dim),
+            initializer="glorot_uniform",
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        # x: [B, T, D]
+        bsz = tf.shape(x)[0]
+        latents = tf.expand_dims(self.latents, axis=0)           # [1, L, D]
+        latents = tf.repeat(latents, repeats=bsz, axis=0)        # [B, L, D]
+
+        # Latents attend to input
+        lat = self.cross_in(latents, x, x)
+        lat = self.ln_in(lat + latents)
+
+        # Input attends to latents
+        out = self.cross_out(x, lat, lat)
+        out = self.ln_out(out + x)
+        return out
+
+
 # ------------------------------- Model --------------------------------------- #
 
 def get_model(input_dim: int,
@@ -153,19 +202,18 @@ def get_model(input_dim: int,
         # Residual block output
         h = L.Add(name=f"block{i+1}_out")([h, h_tcn])
 
-    # -------------------------- Self-attention (causal) ----------------------- #
-    # Optional transformer-style refinement (still causal).
-    attn = L.MultiHeadAttention(
+    # -------------------------- Latent attention ------------------------------ #
+    # Perceiver-style: latents <-> input cross-attention (no causal mask needed).
+    lat_attn = _LatentAttention(
+        num_latents=16,
+        dim=hidden,
         num_heads=4,
-        key_dim=hidden // 4,
         dropout=dropout,
-        name="self_attn"
-    )(h, h, use_causal_mask=True)
-    attn = _layer_norm(attn, "attn_ln")
+        name="latent_attn",
+    )(h)
     if dropout and dropout > 0:
-        attn = L.Dropout(dropout, name="attn_do")(attn)
-    h = L.Add(name="attn_res")([h, attn])
-    h = L.Activation("swish", name="attn_act")(h)
+        lat_attn = L.Dropout(dropout, name="attn_do")(lat_attn)
+    h = L.Activation("swish", name="attn_act")(lat_attn)
 
     # ---------------- Stage 1: Δlog-Mel residual (boost + cut) ---------------- #
     # Δ in approx ±1.5 log-power (~±6.5 dB).
