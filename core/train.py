@@ -60,6 +60,10 @@ def load_manifest(path: Path) -> pd.DataFrame:
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
+def _norm_path(path_str: str) -> str:
+    """Normalize Windows-style paths when running under Linux/WSL."""
+    return str(Path(str(path_str).replace("\\", "/")))
+
 def load_feature_stats(stats_npz_path: Path):
     d = np.load(str(stats_npz_path))
     for k in ("mel_mean", "mel_std", "f0_mean", "f0_std"):
@@ -133,7 +137,7 @@ class SequencePadder(Sequence):
         maxT = 0
 
         for row in rows:
-            d = np.load(row["npz"], allow_pickle=False)
+            d = np.load(_norm_path(row["npz"]), allow_pickle=False)
             feats = d["feats"].astype(np.float32)  # [T, D] unnormalized: [mel_log(48), f0, vprob, (opt) ceps]
             T, D = feats.shape
 
@@ -152,7 +156,7 @@ class SequencePadder(Sequence):
                       else np.concatenate([mel_in, f0_in, vprob, ceps], axis=-1)
 
             # Targets: CLEAN Mel (unnormalized) -> z-norm (STRICT)
-            clean_path = str(row["clean"])
+            clean_path = _norm_path(str(row["clean"]))
             pack_clean = self.fx.from_file(clean_path)
             if "mel_log" not in pack_clean:
                 raise KeyError("FeatureExtractor must return 'mel_log' for clean.")
@@ -474,7 +478,7 @@ def main():
                                shuffle=False)
 
     # ---- Model ----
-    sample_npz = np.load(tr_rows[0]["npz"])
+    sample_npz = np.load(_norm_path(tr_rows[0]["npz"]))
     D = int(sample_npz["feats"].shape[-1])
     if D < 50:
         raise ValueError(f"Model input dim must be >=50, got {D}")
@@ -559,9 +563,9 @@ def main():
     dnsmos_sig, dnsmos_bak, dnsmos_ovr = [], [], []
 
     for j, row in enumerate(tqdm(test_rows, desc="Render test samples", ncols=100)):
-        npz_path   = row["npz"]
-        noisy_path = str(row["noisy"])
-        clean_path = str(row["clean"])
+        npz_path   = _norm_path(row["npz"])
+        noisy_path = _norm_path(str(row["noisy"]))
+        clean_path = _norm_path(str(row["clean"]))
 
         feats_n = build_normalized_input_from_npz(npz_path)  # [T,D] normalized
         X = feats_n[None, ...]
