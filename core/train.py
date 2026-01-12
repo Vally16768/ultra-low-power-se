@@ -62,7 +62,14 @@ def ensure_dir(p: Path) -> None:
 
 def _norm_path(path_str: str) -> str:
     """Normalize Windows-style paths when running under Linux/WSL."""
-    return str(Path(str(path_str).replace("\\", "/")))
+    s = str(path_str).replace("\\", "/")
+    if len(s) >= 2 and s[1] == ":" and s[0].isalpha():
+        drive = s[0].lower()
+        rest = s[2:]
+        if rest.startswith("/"):
+            rest = rest[1:]
+        return f"/mnt/{drive}/{rest}"
+    return str(Path(s))
 
 def load_feature_stats(stats_npz_path: Path):
     d = np.load(str(stats_npz_path))
