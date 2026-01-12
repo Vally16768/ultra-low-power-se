@@ -107,7 +107,8 @@ class SequencePadder(Sequence):
     """Loads NPZ rows, normalizes with saved train stats, and pads batches (STRICT)."""
     def __init__(self, rows: List[Dict[str, Any]], batch_size: int, fx: FeatureExtractor,
                  mel_mean: np.ndarray, mel_std: np.ndarray, f0_mean: float, f0_std: float,
-                 shuffle: bool):
+                 shuffle: bool, **kwargs):
+        super().__init__(**kwargs)
         self.rows = rows
         self.batch = int(batch_size)
         self.fx = fx
