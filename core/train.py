@@ -500,12 +500,12 @@ def main():
     model.summary()
 
     # ---- Callbacks ----
-    ckpt_path = args.outdir / "best_tf.keras"
+    ckpt_path = args.outdir / "best_tf.weights.h5"
     cbs = [
         EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True, verbose=1),
         ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6, verbose=1),
         ModelCheckpoint(filepath=str(ckpt_path), monitor="val_loss",
-                        save_best_only=True, save_weights_only=False, verbose=1),
+                        save_best_only=True, save_weights_only=True, verbose=1),
         CSVLogger(str(args.outdir / "history.csv")),
     ]
 
