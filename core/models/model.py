@@ -150,7 +150,7 @@ class _LatentAttention(L.Layer):
 # ------------------------------- Model --------------------------------------- #
 
 def get_model(input_dim: int,
-              hidden: int = 256,
+              hidden: int = 192,
               df_kernel: int = 7,
               dropout: float = 0.1) -> tf.keras.Model:
     """
@@ -173,9 +173,9 @@ def get_model(input_dim: int,
 
     # -------------------------- Mel multi-branch front-end -------------------- #
     # Multi-scale causal convs over mel to enrich short/medium/long contexts.
-    m1 = L.Conv1D(32, kernel_size=3, padding="causal", activation="swish", name="mel_br_k3")(mel_log)
-    m2 = L.Conv1D(32, kernel_size=7, padding="causal", activation="swish", name="mel_br_k7")(mel_log)
-    m3 = L.Conv1D(32, kernel_size=15, padding="causal", activation="swish", name="mel_br_k15")(mel_log)
+    m1 = L.Conv1D(16, kernel_size=3, padding="causal", activation="swish", name="mel_br_k3")(mel_log)
+    m2 = L.Conv1D(16, kernel_size=7, padding="causal", activation="swish", name="mel_br_k7")(mel_log)
+    m3 = L.Conv1D(16, kernel_size=15, padding="causal", activation="swish", name="mel_br_k15")(mel_log)
     mel_multi = L.Concatenate(name="mel_multi")([mel_log, m1, m2, m3])
     mel_multi = _layer_norm(mel_multi, "mel_multi_ln")
 
@@ -216,7 +216,7 @@ def get_model(input_dim: int,
     # -------------------------- Latent attention ------------------------------ #
     # Perceiver-style: latents <-> input cross-attention (no causal mask needed).
     lat_attn = _LatentAttention(
-        num_latents=16,
+        num_latents=8,
         dim=hidden,
         num_heads=4,
         dropout=dropout,
