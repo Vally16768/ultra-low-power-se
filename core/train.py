@@ -499,13 +499,19 @@ def main():
     ]
 
     # ---- Train ----
-    history = model.fit(
-        train_seq,
-        validation_data=val_seq,
-        epochs=args.epochs,
-        callbacks=cbs,
-        verbose=1,
-    )
+    try:
+        print("[INFO] starting fit", flush=True)
+        history = model.fit(
+            train_seq,
+            validation_data=val_seq,
+            epochs=args.epochs,
+            callbacks=cbs,
+            verbose=1,
+        )
+        print("[INFO] fit complete", flush=True)
+    except Exception as e:
+        print(f"[ERROR] fit failed: {e}", file=sys.stderr, flush=True)
+        raise
 
     # ---- Save history JSON ----
     hist_dict = {k: [float(x) for x in v] for k, v in history.history.items()}
