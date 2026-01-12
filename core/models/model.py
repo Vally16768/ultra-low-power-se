@@ -191,6 +191,8 @@ def get_model(input_dim: int,
         h_gru = L.GRU(
             hidden,
             return_sequences=True,
+            reset_after=False,    # avoid CuDNN GRU kernel to prevent GPU crash
+            implementation=1,
             name=f"gru{i+1}"
         )(h)
         h_gru = _layer_norm(h_gru, f"gru{i+1}_ln")
