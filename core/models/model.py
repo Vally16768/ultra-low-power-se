@@ -150,8 +150,8 @@ class _LatentAttention(L.Layer):
 # ------------------------------- Model --------------------------------------- #
 
 def get_model(input_dim: int,
-              hidden: int = 192,
-              df_kernel: int = 7,
+              hidden: int = 128,
+              df_kernel: int = 5,
               dropout: float = 0.1) -> tf.keras.Model:
     """
     Build the Track 1 BIG model.
@@ -173,9 +173,9 @@ def get_model(input_dim: int,
 
     # -------------------------- Mel multi-branch front-end -------------------- #
     # Multi-scale causal convs over mel to enrich short/medium/long contexts.
-    m1 = L.Conv1D(16, kernel_size=3, padding="causal", activation="swish", name="mel_br_k3")(mel_log)
-    m2 = L.Conv1D(16, kernel_size=7, padding="causal", activation="swish", name="mel_br_k7")(mel_log)
-    m3 = L.Conv1D(16, kernel_size=15, padding="causal", activation="swish", name="mel_br_k15")(mel_log)
+    m1 = L.Conv1D(8, kernel_size=3, padding="causal", activation="swish", name="mel_br_k3")(mel_log)
+    m2 = L.Conv1D(8, kernel_size=7, padding="causal", activation="swish", name="mel_br_k7")(mel_log)
+    m3 = L.Conv1D(8, kernel_size=15, padding="causal", activation="swish", name="mel_br_k15")(mel_log)
     mel_multi = L.Concatenate(name="mel_multi")([mel_log, m1, m2, m3])
     mel_multi = _layer_norm(mel_multi, "mel_multi_ln")
 
@@ -186,7 +186,7 @@ def get_model(input_dim: int,
 
     # -------------------------- Hybrid GRU + TCN backbone --------------------- #
     # 3 blocuri: GRU → LN/Dropout → TCN (dilated) → residual cu inputul blocului
-    for i in range(3):
+    for i in range(2):
         # GRU (causal, unidirectional)
         h_gru = L.GRU(
             hidden,
@@ -216,9 +216,9 @@ def get_model(input_dim: int,
     # -------------------------- Latent attention ------------------------------ #
     # Perceiver-style: latents <-> input cross-attention (no causal mask needed).
     lat_attn = _LatentAttention(
-        num_latents=8,
+        num_latents=4,
         dim=hidden,
-        num_heads=4,
+        num_heads=2,
         dropout=dropout,
         name="latent_attn",
     )(h)
@@ -237,7 +237,7 @@ def get_model(input_dim: int,
     # ---------------- Stage 2: Multi-stage deep filtering -------------------- #
     # 3 stacked depthwise Conv1D blocks over Mel bands, with residuals.
     df = masked_logmel
-    for j in range(3):
+    for j in range(2):
         df_block = _causal_depthwise_conv_over_bands(
             df, kernel_size=df_kernel, dilation=(2 ** j), name=f"df_dw{j+1}"
         )
