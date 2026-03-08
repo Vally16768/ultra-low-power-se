@@ -40,11 +40,7 @@ from core.features.feature import FeatureConfig, FeatureExtractor   # noqa: E402
 from core.models.model import get_model                             # noqa: E402
 
 # STRICT metrics
-from metrics.snr import snr_noisy, snr_enhanced                     # noqa: E402
-from metrics.sisdr import sisdr                                     # noqa: E402
-from metrics.pesq import pesq_score                                 # noqa: E402
-from metrics.stoi import stoi_score                                 # noqa: E402
-from metrics.dnsmos import dnsmos_wav                               # noqa: E402
+from metrics.composite import evaluate_pair_metrics                  # noqa: E402
 
 
 # ----------------------------- Utils ----------------------------------------- #
@@ -454,7 +450,7 @@ def main():
                else np.concatenate([mel_in, f0_in, vprob, ceps], axis=-1)
 
     metrics: Dict[str, Any] = {}
-    test_rows = [df_test.iloc[i].to_dict() for i in range(min(12, len(df_test)))]
+    test_rows = [df_test.iloc[i].to_dict() for i in range(len(df_test))]
 
     sr         = int(fcfg.sr)
     stft_win   = int(fcfg.win_length)
@@ -474,9 +470,7 @@ def main():
         htk=True
     ).astype(np.float32)  # [M, F]
 
-    pesq_list, stoi_list, sisdr_list = [], [], []
-    snr_in_list, snr_out_list = [], []
-    dnsmos_sig, dnsmos_bak, dnsmos_ovr = [], [], []
+    collected: Dict[str, List[float]] = {}
 
     for j, row in enumerate(tqdm(test_rows, desc="Render test samples", ncols=100)):
         npz_path   = row["npz"]
@@ -521,31 +515,16 @@ def main():
         sf.write(str(base.with_suffix(".clean.wav")), clean_wav, sr)
         sf.write(str(base.with_suffix(".enh.wav")),   enh_wav,   sr)
 
-        # -------- STRICT SAMPLE ALIGNMENT FOR METRICS --------
-        # SNR_IN on (clean, noisy)
-        clean_snr, noisy_snr = _align_pair_strict(clean_wav, noisy_wav, "clean", "noisy")
-        # All others on (clean, enh)
-        clean_est, enh_est   = _align_pair_strict(clean_wav, enh_wav,   "clean", "enhanced")
-        # ------------------------------------------------------
-
-        # Intrusive metrics (STRICT — must be finite)
-        snr_in  = float(snr_noisy(clean_snr, noisy_snr));   _assert_finite("SNR_IN", snr_in)
-        snr_out = float(snr_enhanced(clean_est, enh_est));  _assert_finite("SNR_OUT", snr_out)
-        sdr     = float(sisdr(clean_est, enh_est));         _assert_finite("SI_SDR", sdr)
-        pesq_v  = float(pesq_score(clean_est, enh_est, sr));_assert_finite("PESQ", pesq_v)
-        stoi_v  = float(stoi_score(clean_est, enh_est, sr, extended=False)); _assert_finite("STOI", stoi_v)
-
-        snr_in_list.append(snr_in)
-        snr_out_list.append(snr_out)
-        sisdr_list.append(sdr)
-        pesq_list.append(pesq_v)
-        stoi_list.append(stoi_v)
-
-        # Non-intrusive metric (STRICT) — uses full enhanced clip on disk
-        dns = dnsmos_wav(str(base.with_suffix(".enh.wav")))
-        dnsmos_sig.append(float(dns["mos_sig"]))
-        dnsmos_bak.append(float(dns["mos_bak"]))
-        dnsmos_ovr.append(float(dns["mos_ovr"]))
+        pair_metrics = evaluate_pair_metrics(
+            clean=clean_wav,
+            noisy=noisy_wav,
+            enhanced=enh_wav,
+            sr=sr,
+            enhanced_path=str(base.with_suffix(".enh.wav")),
+        )
+        for key, value in pair_metrics.items():
+            _assert_finite(key, float(value))
+            collected.setdefault(key, []).append(float(value))
 
     def _mean(xs: List[float], name: str) -> float:
         if not xs:
@@ -554,16 +533,7 @@ def main():
         _assert_finite(name, m)
         return m
 
-    metrics: Dict[str, Any] = {
-        "SNR_IN":      _mean(snr_in_list, "SNR_IN"),
-        "SNR_OUT":     _mean(snr_out_list, "SNR_OUT"),
-        "SI_SDR":      _mean(sisdr_list, "SI_SDR"),
-        "PESQ":        _mean(pesq_list, "PESQ"),
-        "STOI":        _mean(stoi_list, "STOI"),
-        "DNSMOS_SIG":  _mean(dnsmos_sig, "DNSMOS_SIG"),
-        "DNSMOS_BAK":  _mean(dnsmos_bak, "DNSMOS_BAK"),
-        "DNSMOS_OVR":  _mean(dnsmos_ovr, "DNSMOS_OVR"),
-    }
+    metrics = {key: _mean(values, key) for key, values in sorted(collected.items())}
 
     with open(args.outdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)

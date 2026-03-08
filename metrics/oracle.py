@@ -10,20 +10,19 @@ import csv, json, sys, os
 import statistics as st
 import numpy as np
 import soundfile as sf
-from core.data.resample_audio import resample_audio
+import librosa
 
-# Import local metric modules
-from pesq import pesq_score
-from stoi import stoi_score
-from snr import delta_snr
-from sisdr import sisdr
+from metrics.composite import evaluate_pair_metrics
 
 
 DEFAULT_THRESH = {
     "PESQ": 3.00,
     "STOI": 0.93,
-    "DELTA_SNR": 9.0,   # dB
+    "SNRi": 0.0,
     "SI_SDR": 10.0,     # dB
+    "CSIG": 3.0,
+    "CBAK": 3.0,
+    "COVL": 3.0,
     "STREAM_LAT_MS": 40.0,  # placeholder for streaming runs
 }
 
@@ -35,7 +34,7 @@ def _load(path):
 
 def _match_sr_to(ref_sig: np.ndarray, ref_fs: int, x: np.ndarray, x_fs: int):
     if x_fs != ref_fs:
-        x = resample_audio(x, x_fs, ref_fs)
+        x = librosa.resample(x, orig_sr=x_fs, target_sr=ref_fs, res_type="kaiser_fast")
     n = min(len(ref_sig), len(x))
     return ref_sig[:n], x[:n], ref_fs
 
@@ -48,12 +47,7 @@ def eval_pair(clean_path, noisy_path, enhanced_path):
     clean2, noisy2, fs_use = _match_sr_to(clean, fs_c, noisy, fs_n)
     clean3, enh2, _ = _match_sr_to(clean2, fs_use, enh, fs_e)
 
-    # Intrusive metrics (raise on error; we want hard failure in CI)
-    pesq = pesq_score(clean3, enh2, fs_use)
-    stoi = stoi_score(clean3, enh2, fs_use, extended=False)
-    dsnr = delta_snr(clean3, noisy2, enh2)
-    sdr = sisdr(clean3, enh2)
-    return {"PESQ": pesq, "STOI": stoi, "DELTA_SNR": dsnr, "SI_SDR": sdr}
+    return evaluate_pair_metrics(clean3, noisy2, enh2, fs_use)
 
 
 def _read_manifest(manifest_csv: str):

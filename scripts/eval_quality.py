@@ -1,33 +1,19 @@
 #!/usr/bin/env python3
-import argparse, numpy as np, soundfile as sf, librosa, json
+import argparse, json, sys
 from pathlib import Path
 
+import librosa
+import numpy as np
+import soundfile as sf
+
+_THIS = Path(__file__).resolve()
+_ROOT = _THIS.parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from metrics.composite import evaluate_pair_metrics
+
 AUDIO_EXTS = {".wav", ".flac", ".ogg", ".mp3", ".m4a", ".aac"}
-
-def si_snr(ref, est, eps=1e-8):
-    ref = ref - ref.mean()
-    est = est - est.mean()
-    s = np.dot(est, ref) / (np.dot(ref, ref) + eps) * ref
-    e = est - s
-    return 10*np.log10((np.dot(s, s) + eps) / (np.dot(e, e) + eps))
-
-def snr(ref, est, eps=1e-8):
-    e = ref - est
-    return 10*np.log10((np.sum(ref**2)+eps)/(np.sum(e**2)+eps))
-
-def try_pesq(sr, ref, deg):
-    try:
-        from pesq import pesq
-        return float(pesq(sr, ref, deg, 'wb'))
-    except Exception:
-        return None
-
-def try_stoi(sr, ref, deg):
-    try:
-        from pystoi import stoi
-        return float(stoi(ref, deg, sr, extended=False))
-    except Exception:
-        return None
 
 def load_audio_any(p, target_sr):
     try:
@@ -57,6 +43,7 @@ def main():
     ap.add_argument("--enh_dir",   required=True, help="Directory with enhanced outputs (.wav)")
     ap.add_argument("--sr", type=int, default=16000)
     ap.add_argument("--out_json", default="artifacts/onnx_eval/metrics.json")
+    ap.add_argument("--out_csv", default=None, help="Optional per-file CSV path")
     args = ap.parse_args()
 
     clean = index_by_stem(args.clean_dir)
@@ -74,38 +61,43 @@ def main():
         deg, _ = load_audio_any(enh[nm],   args.sr)
         noz, _ = load_audio_any(noisy[nm], args.sr)
 
-        L = min(len(ref), len(deg), len(noz))
-        ref, deg, noz = ref[:L], deg[:L], noz[:L]
-
-        sisnr_e = si_snr(ref, deg); sisnr_n = si_snr(ref, noz); sisnri = sisnr_e - sisnr_n
-        snr_e   = snr(ref, deg);     snr_n   = snr(ref, noz);   snri   = snr_e   - snr_n
-        pesq = try_pesq(args.sr, ref, deg)
-        stoi = try_stoi(args.sr, ref, deg)
-
-        results.append({
+        row = {
             "stem": nm,
             "clean": str(clean[nm]),
             "noisy": str(noisy[nm]),
             "enh":   str(enh[nm]),
-            "SI-SNRi": float(sisnri),
-            "SNRi": float(snri),
-            "PESQ": None if pesq is None else float(pesq),
-            "STOI": None if stoi is None else float(stoi),
-        })
+        }
+        row.update(evaluate_pair_metrics(ref, noz, deg, args.sr, enhanced_path=str(enh[nm])))
+        results.append(row)
 
     import statistics as st
-    def mean(xs): xs = [v for v in xs if v is not None]; return None if not xs else float(st.mean(xs))
-    summary = {
-        "count": len(results),
-        "avg_SI-SNRi": mean([r["SI-SNRi"] for r in results]),
-        "avg_SNRi": mean([r["SNRi"] for r in results]),
-        "avg_PESQ": mean([r["PESQ"] for r in results]),
-        "avg_STOI": mean([r["STOI"] for r in results]),
-    }
+    def mean(key):
+        values = [float(r[key]) for r in results if key in r and r[key] is not None]
+        return None if not values else float(st.mean(values))
+
+    metric_keys = [
+        "PESQ", "CSIG", "CBAK", "COVL", "STOI", "SI_SDR", "SNR_IN", "SNR_OUT",
+        "SNRi", "SI-SNRi", "DNSMOS_SIG", "DNSMOS_BAK", "DNSMOS_OVR",
+    ]
+    summary = {"count": len(results)}
+    for key in metric_keys:
+        summary[f"avg_{key}"] = mean(key)
 
     outp = Path(args.out_json); outp.parent.mkdir(parents=True, exist_ok=True)
     with open(outp, "w") as f:
         json.dump({"summary": summary, "items": results}, f, indent=2)
+
+    if args.out_csv:
+        import csv
+
+        out_csv = Path(args.out_csv)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = ["stem", "clean", "noisy", "enh"] + metric_keys
+        with open(out_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in results:
+                writer.writerow({key: row.get(key) for key in fieldnames})
 
     print(f"[OK] Wrote {outp} (files={len(results)})")
     print("Summary:", summary)

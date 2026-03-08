@@ -1,6 +1,14 @@
 .venv/
 __pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 voicebank-demand/
 feat_cache/
+runs/feat_cache*/
 .venv310/
 dns-challenge/
+classic_baselines/artifacts/
+classic_baselines/runs/
